@@ -233,4 +233,3 @@ def test_process_family_tracker_background_polling_and_delayed_attach() -> None:
     assert family.root_pid == 5000
     assert family.all_pids == {5000}
     assert timeline.get_active_ports({5000}) == {49152}
-

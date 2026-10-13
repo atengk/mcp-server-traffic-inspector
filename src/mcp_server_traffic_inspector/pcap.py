@@ -349,9 +349,7 @@ class PcapCaptureManager:
 
         # 在进程抓包模式下，底层 tshark 捕获到中间原始文件
         capture_file = (
-            target_path.parent / f"raw_{target_path.name}"
-            if is_process_mode
-            else target_path
+            target_path.parent / f"raw_{target_path.name}" if is_process_mode else target_path
         )
 
         if is_process_mode:
