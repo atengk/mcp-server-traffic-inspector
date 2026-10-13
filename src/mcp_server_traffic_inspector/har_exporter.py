@@ -18,11 +18,10 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
+from mcp_server_traffic_inspector import __version__ as VERSION
 from mcp_server_traffic_inspector.storage import StorageBus
 
 logger = logging.getLogger("mcp_server_traffic_inspector.har_exporter")
-
-VERSION = "0.1.0"
 
 
 class HarExporter:
