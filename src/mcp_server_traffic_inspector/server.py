@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server_traffic_inspector.capture_manager import HttpCaptureManager
 from mcp_server_traffic_inspector.config import LOGGER_NAME, ServerConfig
+from mcp_server_traffic_inspector.diagnostics import NetworkDiagnostics
 from mcp_server_traffic_inspector.pcap import PcapCaptureManager
 from mcp_server_traffic_inspector.replay import FlowReplayEngine
 from mcp_server_traffic_inspector.storage import DEFAULT_PREVIEW_CHARS, StorageBus
@@ -340,12 +341,51 @@ def _register_pcap_tools(
         )
 
 
+def _register_diagnostic_tools(
+    mcp: FastMCP,
+    diagnostics: NetworkDiagnostics,
+) -> None:
+    @mcp.tool()
+    def analyze_http_traffic(
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """统计慢请求 Top 5、状态码分布、高频端点 Top 10 与总吞吐流量。
+
+        Args:
+            session_id: 可选的目标抓包会话 ID；未提供时默认统计最近一次抓包会话。
+
+        Returns:
+            包含慢请求排行、错误分布、高频端点及大报文消耗的聚合统计字典。
+        """
+        return diagnostics.analyze_http_traffic(session_id=session_id)
+
+    @mcp.tool()
+    def diagnose_network_session(
+        session_type: str = "http",
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        """对 HTTP 流量或 PCAP 报文生成结构化健康度评分、异常项与根因诊断报告。
+
+        Args:
+            session_type: 诊断类型，可选 'http' 或 'pcap'，默认 'http'。
+            target: 当 session_type='http' 时为可选 session_id；当 'pcap' 时为必填文件路径。
+
+        Returns:
+            包含健康度评分、健康状态、异常清单与排障建议的诊断报告。
+        """
+        return diagnostics.diagnose_network_session(
+            session_type=session_type,
+            target=target,
+        )
+
+
 def create_mcp_server(
     config: ServerConfig,
     storage: StorageBus | None = None,
     capture_manager: HttpCaptureManager | None = None,
     replay_engine: FlowReplayEngine | None = None,
     pcap_manager: PcapCaptureManager | None = None,
+    diagnostics: NetworkDiagnostics | None = None,
     lifecycle: LifecycleManager | None = None,
 ) -> FastMCP:
     """构建并初始化 FastMCP 服务实例、共享 SQLite WAL 数据总线与 MCP 工具集。
@@ -356,6 +396,7 @@ def create_mcp_server(
         capture_manager: 可选的外部 HttpCaptureManager 实例。
         replay_engine: 可选的外部 FlowReplayEngine 实例。
         pcap_manager: 可选的外部 PcapCaptureManager 实例。
+        diagnostics: 可选的外部 NetworkDiagnostics 实例。
         lifecycle: 可选的生命周期管理器；传入时自动注册子进程停止钩子。
 
     Returns:
@@ -367,6 +408,7 @@ def create_mcp_server(
     manager = capture_manager or HttpCaptureManager(storage=bus)
     replayer = replay_engine or FlowReplayEngine(storage=bus)
     pcap_mgr = pcap_manager or PcapCaptureManager(tshark_path=config.tshark_path)
+    diag_engine = diagnostics or NetworkDiagnostics(storage=bus, pcap_manager=pcap_mgr)
 
     if lifecycle is not None:
         lifecycle.register(lambda: None if manager.stop_capture() else None)
@@ -383,4 +425,5 @@ def create_mcp_server(
     _register_http_tools(mcp=mcp, storage=bus, manager=manager)
     _register_manipulation_tools(mcp=mcp, storage=bus, replay_engine=replayer)
     _register_pcap_tools(mcp=mcp, pcap_manager=pcap_mgr)
+    _register_diagnostic_tools(mcp=mcp, diagnostics=diag_engine)
     return mcp
