@@ -15,9 +15,16 @@ from mcp.server.fastmcp import FastMCP
 from mcp_server_traffic_inspector.capture_manager import HttpCaptureManager
 from mcp_server_traffic_inspector.config import LOGGER_NAME, ServerConfig
 from mcp_server_traffic_inspector.diagnostics import NetworkDiagnostics
+from mcp_server_traffic_inspector.har_exporter import HarExporter
 from mcp_server_traffic_inspector.pcap import PcapCaptureManager
 from mcp_server_traffic_inspector.replay import FlowReplayEngine
 from mcp_server_traffic_inspector.storage import DEFAULT_PREVIEW_CHARS, StorageBus
+from mcp_server_traffic_inspector.system_proxy import (
+    SystemProxyManager,
+)
+from mcp_server_traffic_inspector.system_proxy import (
+    get_ca_certificate as get_ca_cert_info,
+)
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -379,6 +386,63 @@ def _register_diagnostic_tools(
         )
 
 
+def _register_ops_tools(
+    mcp: FastMCP,
+    system_proxy: SystemProxyManager,
+    har_exporter: HarExporter,
+) -> None:
+    """注册 CA 证书指引、跨平台系统代理托管与 HAR 会话归档导出工具集。"""
+
+    @mcp.tool()
+    def get_ca_certificate() -> dict[str, Any]:
+        """获取 mitmproxy 本地 CA 根证书路径及 Windows/Linux 信任安装指引。
+
+        Returns:
+            包含证书文件路径与系统证书库导入命令指引的结构化字典。
+        """
+        return get_ca_cert_info()
+
+    @mcp.tool()
+    def toggle_system_proxy(
+        enable: bool,
+        port: int = 8080,
+        host: str = "127.0.0.1",
+    ) -> dict[str, Any]:
+        """开启或关闭操作系统全局代理（Windows 注册表托管；非 Windows 优雅降级指引）。
+
+        Args:
+            enable: 是否开启系统代理。
+            port: 代理端口，默认 8080。
+            host: 代理主机地址，默认 127.0.0.1。
+
+        Returns:
+            包含平台支持状态、当前代理开启状态及详细说明的结构化字典。
+        """
+        return system_proxy.toggle_proxy(enable=enable, host=host, port=port)
+
+    @mcp.tool()
+    def export_http_session(
+        output_path: str,
+        session_id: str | None = None,
+        format: str = "har",
+    ) -> dict[str, Any]:
+        """将指定或最近一次抓包会话的全部流量与完整载荷导出为标准 HAR 1.2 归档文件。
+
+        Args:
+            output_path: 导出的目标 HAR 文件路径。
+            session_id: 可选的目标会话 ID；未提供时自动定位最近一次抓包会话。
+            format: 导出文件格式，默认 'har'。
+
+        Returns:
+            包含导出文件路径、格式、流条目数量与文件字节大小的结构化字典。
+        """
+        return har_exporter.export_session(
+            output_path=output_path,
+            session_id=session_id,
+            format=format,
+        )
+
+
 def create_mcp_server(
     config: ServerConfig,
     storage: StorageBus | None = None,
@@ -386,6 +450,8 @@ def create_mcp_server(
     replay_engine: FlowReplayEngine | None = None,
     pcap_manager: PcapCaptureManager | None = None,
     diagnostics: NetworkDiagnostics | None = None,
+    system_proxy: SystemProxyManager | None = None,
+    har_exporter: HarExporter | None = None,
     lifecycle: LifecycleManager | None = None,
 ) -> FastMCP:
     """构建并初始化 FastMCP 服务实例、共享 SQLite WAL 数据总线与 MCP 工具集。
@@ -397,10 +463,12 @@ def create_mcp_server(
         replay_engine: 可选的外部 FlowReplayEngine 实例。
         pcap_manager: 可选的外部 PcapCaptureManager 实例。
         diagnostics: 可选的外部 NetworkDiagnostics 实例。
-        lifecycle: 可选的生命周期管理器；传入时自动注册子进程停止钩子。
+        system_proxy: 可选的外部 SystemProxyManager 实例。
+        har_exporter: 可选的外部 HarExporter 实例。
+        lifecycle: 可选的生命周期管理器；传入时自动注册子进程与代理状态停止钩子。
 
     Returns:
-        完成工具注册的 FastMCP 服务对象。
+        完成全部 18 个工具注册的 FastMCP 服务对象。
     """
     # 1. 初始化共享 SQLite WAL 数据总线与核心业务管理器
     bus = storage or StorageBus.from_config(config)
@@ -409,12 +477,15 @@ def create_mcp_server(
     replayer = replay_engine or FlowReplayEngine(storage=bus)
     pcap_mgr = pcap_manager or PcapCaptureManager(tshark_path=config.tshark_path)
     diag_engine = diagnostics or NetworkDiagnostics(storage=bus, pcap_manager=pcap_mgr)
+    sys_proxy = system_proxy or SystemProxyManager()
+    har_exp = har_exporter or HarExporter(storage=bus)
 
     if lifecycle is not None:
         lifecycle.register(lambda: None if manager.stop_capture() else None)
         lifecycle.register(lambda: None if pcap_mgr.stop_capture() else None)
+        lifecycle.register(lambda: sys_proxy.restore_initial_state())
 
-    # 2. 创建 FastMCP 主控实例并注册各领域工具集
+    # 2. 创建 FastMCP 主控实例并注册各领域工具集 (18 个 Tools)
     mcp = FastMCP(
         name=SERVER_NAME,
         instructions=SERVER_INSTRUCTIONS,
@@ -426,4 +497,5 @@ def create_mcp_server(
     _register_manipulation_tools(mcp=mcp, storage=bus, replay_engine=replayer)
     _register_pcap_tools(mcp=mcp, pcap_manager=pcap_mgr)
     _register_diagnostic_tools(mcp=mcp, diagnostics=diag_engine)
+    _register_ops_tools(mcp=mcp, system_proxy=sys_proxy, har_exporter=har_exp)
     return mcp

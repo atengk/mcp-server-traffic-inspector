@@ -504,11 +504,20 @@ class StorageBus:
             "flows": flows,
         }
 
-    def _resolve_raw_body(
+    def resolve_raw_body(
         self,
         blob_val: bytes | None,
         path_val: str | None,
     ) -> bytes:
+        """从内联 BLOB 或外部转储文件解析完整无损的 BodyPayload 原始字节。
+
+        Args:
+            blob_val: 数据库存储的内联 BLOB 字节（≤256KB）。
+            path_val: 外部磁盘转储文件绝对路径（>256KB）。
+
+        Returns:
+            无损原始请求或响应体字节；若均不存在则返回空字节。
+        """
         if blob_val is not None:
             return bytes(blob_val)
         if path_val:
@@ -516,6 +525,8 @@ class StorageBus:
             if file_path.is_file():
                 return file_path.read_bytes()
         return b""
+
+    _resolve_raw_body = resolve_raw_body
 
     def _build_body_detail(
         self,
