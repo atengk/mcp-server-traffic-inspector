@@ -10,12 +10,14 @@ import json
 import logging
 import shutil
 import sqlite3
+import time
 from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from mcp_server_traffic_inspector.config import LOGGER_NAME, ServerConfig
 
@@ -650,6 +652,199 @@ class StorageBus:
             )
 
         return result
+
+    def get_flow_for_replay(self, flow_id: str) -> dict[str, Any] | None:
+        """读取单条 HttpFlow 的完整无损请求与响应原始字节（专供 FlowReplay 重放与 Diff 使用）。
+
+        Args:
+            flow_id: 目标历史 HttpFlow 的唯一 ID。
+
+        Returns:
+            包含请求行、头部、完整原始请求体字节与历史响应体字节的字典；不存在时返回 None。
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    f.id, f.session_id, f.method, f.scheme, f.host, f.port, f.path,
+                    f.status_code, f.duration_ms, f.request_headers, f.response_headers,
+                    f.request_content_type, f.response_content_type,
+                    b.request_body, b.response_body,
+                    b.is_request_binary, b.is_response_binary,
+                    b.request_body_path, b.response_body_path
+                FROM http_flows f
+                LEFT JOIN http_bodies b ON f.id = b.flow_id
+                WHERE f.id = ?;
+                """,
+                (flow_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        req_bytes = self._resolve_raw_body(row["request_body"], row["request_body_path"])
+        resp_bytes = self._resolve_raw_body(row["response_body"], row["response_body_path"])
+        return {
+            "id": str(row["id"]),
+            "session_id": str(row["session_id"]),
+            "method": str(row["method"]),
+            "url": _format_url(
+                str(row["scheme"]),
+                str(row["host"]),
+                int(row["port"]),
+                str(row["path"]),
+            ),
+            "status_code": int(row["status_code"]) if row["status_code"] is not None else None,
+            "duration_ms": float(row["duration_ms"]) if row["duration_ms"] is not None else None,
+            "request_headers": json.loads(row["request_headers"] or "{}"),
+            "response_headers": json.loads(row["response_headers"] or "{}"),
+            "request_content_type": row["request_content_type"],
+            "response_content_type": row["response_content_type"],
+            "request_body_bytes": req_bytes,
+            "response_body_bytes": resp_bytes,
+            "is_response_binary": bool(row["is_response_binary"]),
+        }
+
+    def add_intercept_rule(
+        self,
+        *,
+        url_pattern: str,
+        action: str = "mock",
+        mock_status: int = 200,
+        mock_headers: Mapping[str, str] | None = None,
+        mock_body: str | Mapping[str, Any] | list[Any] | None = None,
+        modify_request_headers: Mapping[str, str] | None = None,
+        modify_response_headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """新增一条非阻塞动态拦截规则 (InterceptRule) 并持久化至 SQLite。
+
+        Args:
+            url_pattern: URL 匹配模式（支持正则表达式、通配符或子串）。
+            action: 拦截动作，可选 'mock' 或 'modify'。
+            mock_status: 当 action='mock' 时返回的 HTTP 状态码，默认 200。
+            mock_headers: 当 action='mock' 时返回的自定义响应头。
+            mock_body: 当 action='mock' 时返回的响应正文字符串或 JSON 结构。
+            modify_request_headers: 转发前注入或覆盖的请求头字典。
+            modify_response_headers: 返回前注入或覆盖的响应头字典。
+
+        Returns:
+            包含 rule_id、action、url_pattern 与 status ("active") 的字典。
+
+        Raises:
+            ValueError: 当 url_pattern 为空或 action 非法时抛出。
+        """
+        pattern = url_pattern.strip()
+        if not pattern:
+            raise ValueError("url_pattern 不能为空")
+
+        normalized_action = action.strip().lower()
+        if normalized_action not in {"mock", "modify"}:
+            raise ValueError(f"不支持的拦截规则动作: {action}（仅支持 'mock' 或 'modify'）")
+
+        if mock_body is None or isinstance(mock_body, str):
+            serialized_mock_body = mock_body
+        else:
+            serialized_mock_body = json.dumps(mock_body, ensure_ascii=False)
+
+        rule_id = f"rule_{uuid4().hex[:10]}"
+        created_at = time.time()
+
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO intercept_rules (
+                    id, enabled, url_pattern, action, mock_status,
+                    mock_headers, mock_body, modify_request_headers,
+                    modify_response_headers, created_at
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    rule_id,
+                    pattern,
+                    normalized_action,
+                    int(mock_status),
+                    json.dumps(dict(mock_headers or {}), ensure_ascii=False),
+                    serialized_mock_body,
+                    json.dumps(dict(modify_request_headers or {}), ensure_ascii=False),
+                    json.dumps(dict(modify_response_headers or {}), ensure_ascii=False),
+                    created_at,
+                ),
+            )
+            conn.commit()
+
+        return {
+            "rule_id": rule_id,
+            "action": normalized_action,
+            "url_pattern": pattern,
+            "status": "active",
+        }
+
+    def list_intercept_rules(self, *, only_enabled: bool = False) -> list[dict[str, Any]]:
+        """查询当前配置的动态拦截规则列表。
+
+        Args:
+            only_enabled: 是否仅返回 enabled=1 的生效规则，默认 False。
+
+        Returns:
+            规则字典列表；无规则时固定返回空列表 []。
+        """
+        where_clause = "WHERE enabled = 1" if only_enabled else ""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id, enabled, url_pattern, action, mock_status,
+                    mock_headers, mock_body, modify_request_headers,
+                    modify_response_headers, created_at
+                FROM intercept_rules
+                {where_clause}
+                ORDER BY created_at ASC;
+                """
+            ).fetchall()
+
+        rules: list[dict[str, Any]] = []
+        for row in rows:
+            rules.append(
+                {
+                    "id": str(row["id"]),
+                    "enabled": bool(row["enabled"]),
+                    "url_pattern": str(row["url_pattern"]),
+                    "action": str(row["action"]),
+                    "mock_status": int(row["mock_status"] or 200),
+                    "mock_headers": json.loads(row["mock_headers"] or "{}"),
+                    "mock_body": row["mock_body"],
+                    "modify_request_headers": json.loads(row["modify_request_headers"] or "{}"),
+                    "modify_response_headers": json.loads(row["modify_response_headers"] or "{}"),
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        return rules
+
+    def clear_intercept_rules(self, rule_id: str | None = None) -> dict[str, Any]:
+        """清理指定的单条动态拦截规则或清空全部规则。
+
+        Args:
+            rule_id: 可选的目标规则 ID；为 None 时清空全部规则。
+
+        Returns:
+            包含 cleared_count 与 target_rule_id 的字典。
+        """
+        target = rule_id.strip() if rule_id and rule_id.strip() else None
+        with closing(self._connect()) as conn:
+            if target:
+                cursor = conn.execute(
+                    "DELETE FROM intercept_rules WHERE id = ?;",
+                    (target,),
+                )
+            else:
+                cursor = conn.execute("DELETE FROM intercept_rules;")
+            cleared = int(cursor.rowcount or 0)
+            conn.commit()
+
+        return {
+            "cleared_count": cleared,
+            "target_rule_id": target,
+        }
 
     def verify_health(self) -> StorageHealth:
         """探测当前 SQLite WAL 数据总线与分流目录的读写状态及表结构完整性。

@@ -1,4 +1,4 @@
-"""mitmdump 流量采集插件模块，负责采集过滤、压缩载荷解压与 SQLite WAL 写入。
+"""mitmdump 流量采集与非阻塞规则拦截插件模块，负责采集过滤、规则 Mock/改写、解压与入库。
 
 @author Ateng
 @since 2026-10-13
@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import fnmatch
 import gzip
 import logging
 import os
+import re
 import time
 import zlib
 from collections.abc import Mapping
@@ -16,8 +18,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from mitmproxy import http as mitm_http
+
 from mcp_server_traffic_inspector.config import LOGGER_NAME
-from mcp_server_traffic_inspector.storage import StorageBus
+from mcp_server_traffic_inspector.storage import StorageBus, _format_url
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -32,6 +36,33 @@ def _matches_filter_host(request_host: str, filter_host: str | None) -> bool:
     return host_lower == target or host_lower.endswith(f".{target}") or target in host_lower
 
 
+def _extract_flow_url(req: Any) -> str:
+    pretty_url = getattr(req, "pretty_url", None)
+    if pretty_url:
+        return str(pretty_url)
+    scheme = str(getattr(req, "scheme", "http"))
+    host = str(getattr(req, "pretty_host", None) or getattr(req, "host", "") or "")
+    port = int(getattr(req, "port", 443 if scheme == "https" else 80))
+    path = str(getattr(req, "path", "/"))
+    return _format_url(scheme, host, port, path)
+
+
+def _matches_url_pattern(url: str, pattern: str) -> bool:
+    if not pattern:
+        return False
+    if pattern in url:
+        return True
+    if "*" in pattern or "?" in pattern:
+        if fnmatch.fnmatch(url, pattern) or fnmatch.fnmatch(url, f"*{pattern}*"):
+            return True
+    try:
+        if re.search(pattern, url):
+            return True
+    except re.error:
+        return False
+    return False
+
+
 def _extract_headers_dict(headers_obj: Any) -> dict[str, str]:
     if not headers_obj:
         return {}
@@ -40,6 +71,16 @@ def _extract_headers_dict(headers_obj: Any) -> dict[str, str]:
     if hasattr(headers_obj, "items"):
         return {str(k): str(v) for k, v in headers_obj.items()}
     return {}
+
+
+def _apply_headers_mutation(target_obj: Any, headers_to_set: Mapping[str, str]) -> None:
+    if target_obj is None or not headers_to_set:
+        return
+    headers_attr = getattr(target_obj, "headers", None)
+    if headers_attr is None:
+        return
+    for key, val in headers_to_set.items():
+        headers_attr[str(key)] = str(val)
 
 
 def _extract_decompressed_body(message_obj: Any, headers: Mapping[str, str]) -> bytes:
@@ -91,10 +132,10 @@ def _calculate_duration_ms(request_obj: Any, response_obj: Any) -> float | None:
 
 
 class TrafficCaptureAddon:
-    """挂载于 mitmdump 子进程的 HTTP/HTTPS 流量录制插件。
+    """挂载于 mitmdump 子进程的 HTTP/HTTPS 流量录制与非阻塞规则拦截插件。
 
-    根据 filter_host 执行非侵入采集过滤（不阻断非目标流量转发），
-    自动解压请求与响应 BodyPayload 并写入共享 SQLite WAL 总线。
+    支持从 SQLite 热同步 InterceptRule（Mock 短路返回与请求/响应头动态改写），
+    根据 filter_host 执行非侵入采集过滤，并自动解压 BodyPayload 写入共享 SQLite WAL 总线。
     """
 
     def __init__(
@@ -103,7 +144,7 @@ class TrafficCaptureAddon:
         session_id: str,
         filter_host: str | None = None,
     ) -> None:
-        """初始化抓包插件实例。
+        """初始化抓包与拦截插件实例。
 
         Args:
             storage: 指向共享 SQLite WAL 的 StorageBus 实例。
@@ -135,6 +176,47 @@ class TrafficCaptureAddon:
         storage = StorageBus(db_path=db_path, bodies_dir=bodies_dir, preserve_db=True)
         storage.initialize()
         return cls(storage=storage, session_id=session_id, filter_host=filter_host)
+
+    def _load_matching_rules(self, url: str) -> list[dict[str, Any]]:
+        try:
+            active_rules = self.storage.list_intercept_rules(only_enabled=True)
+        except Exception as exc:
+            logger.debug("读取动态拦截规则失败: %s", exc)
+            return []
+        return [r for r in active_rules if _matches_url_pattern(url, str(r["url_pattern"]))]
+
+    def request(self, flow: Any) -> None:
+        """mitmproxy 请求到达阶段钩子，热读取规则执行请求头改写或 Mock 短路返回。
+
+        Args:
+            flow: mitmproxy HTTPFlow 实例。
+        """
+        req = getattr(flow, "request", None)
+        if req is None:
+            return
+
+        # 1. 热查询匹配当前请求 URL 的生效拦截规则
+        url = _extract_flow_url(req)
+        matched_rules = self._load_matching_rules(url)
+        if not matched_rules:
+            return
+
+        # 2. 按序应用请求头改写或触发 Mock 响应直接短路返回
+        for rule in matched_rules:
+            req_mods = rule.get("modify_request_headers") or {}
+            if req_mods:
+                _apply_headers_mutation(req, req_mods)
+
+            if rule.get("action") == "mock":
+                status_code = int(rule.get("mock_status") or 200)
+                body_str = rule.get("mock_body") or ""
+                body_bytes = body_str.encode("utf-8")
+                headers_dict = {str(k): str(v) for k, v in (rule.get("mock_headers") or {}).items()}
+                flow.response = mitm_http.Response.make(
+                    status_code=status_code,
+                    content=body_bytes,
+                    headers=headers_dict,
+                )
 
     def _persist_flow(self, flow: Any, has_error: bool = False) -> None:
         req = getattr(flow, "request", None)
@@ -189,11 +271,20 @@ class TrafficCaptureAddon:
             logger.warning("写入 HttpFlow (%s) 至 SQLite 失败: %s", flow_id, exc)
 
     def response(self, flow: Any) -> None:
-        """mitmproxy 响应完成事件钩子。
+        """mitmproxy 响应完成事件钩子，执行响应头改写规则并持久化流记录。
 
         Args:
             flow: mitmproxy HTTPFlow 实例。
         """
+        req = getattr(flow, "request", None)
+        resp = getattr(flow, "response", None)
+        if req is not None and resp is not None:
+            url = _extract_flow_url(req)
+            for rule in self._load_matching_rules(url):
+                resp_mods = rule.get("modify_response_headers") or {}
+                if resp_mods:
+                    _apply_headers_mutation(resp, resp_mods)
+
         self._persist_flow(flow, has_error=False)
 
     def error(self, flow: Any) -> None:

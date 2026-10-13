@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server_traffic_inspector.capture_manager import HttpCaptureManager
 from mcp_server_traffic_inspector.config import LOGGER_NAME, ServerConfig
+from mcp_server_traffic_inspector.replay import FlowReplayEngine
 from mcp_server_traffic_inspector.storage import DEFAULT_PREVIEW_CHARS, StorageBus
 
 logger = logging.getLogger(LOGGER_NAME)
@@ -179,10 +180,97 @@ def _register_http_tools(
         return detail
 
 
+def _register_manipulation_tools(
+    mcp: FastMCP,
+    storage: StorageBus,
+    replay_engine: FlowReplayEngine,
+) -> None:
+    @mcp.tool()
+    async def replay_http_request(
+        flow_id: str,
+        modify_headers: dict[str, str] | None = None,
+        modify_body: str | dict[str, Any] | list[Any] | None = None,
+        modify_url: str | None = None,
+    ) -> dict[str, Any]:
+        """基于已捕获的历史 HttpFlow 执行参数变异重放 (FlowReplay)，并对比新旧响应差异。
+
+        Args:
+            flow_id: 待重放的历史 HttpFlow 唯一 ID。
+            modify_headers: 可选的覆盖或新增请求头字典。
+            modify_body: 可选的覆盖请求体文本；不传时使用存储层完整无损的原始请求体。
+            modify_url: 可选的覆盖目标 URL；不传时使用原请求 URL。
+
+        Returns:
+            包含原响应摘要、新响应摘要及状态码、耗时与正文 Diff 预览的结构化对比字典。
+        """
+        return await replay_engine.replay(
+            flow_id=flow_id,
+            modify_headers=modify_headers,
+            modify_body=modify_body,
+            modify_url=modify_url,
+        )
+
+    @mcp.tool()
+    def add_intercept_rule(
+        url_pattern: str,
+        action: str = "mock",
+        mock_status: int = 200,
+        mock_headers: dict[str, str] | None = None,
+        mock_body: str | dict[str, Any] | list[Any] | None = None,
+        modify_request_headers: dict[str, str] | None = None,
+        modify_response_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """新增一条非阻塞动态拦截规则 (InterceptRule)，支持 Mock 短路返回与 Header 动态改写。
+
+        Args:
+            url_pattern: 目标 URL 匹配模式（支持正则、通配符或子串）。
+            action: 规则动作，可选 'mock' 或 'modify'，默认 'mock'。
+            mock_status: 当 action='mock' 时返回的状态码，默认 200。
+            mock_headers: 当 action='mock' 时返回的自定义响应头。
+            mock_body: 当 action='mock' 时返回的响应正文。
+            modify_request_headers: 转发前注入或改写的请求头。
+            modify_response_headers: 返回前注入或改写的响应头。
+
+        Returns:
+            包含 rule_id、action、url_pattern 与 status ("active") 的字典。
+        """
+        return storage.add_intercept_rule(
+            url_pattern=url_pattern,
+            action=action,
+            mock_status=mock_status,
+            mock_headers=mock_headers,
+            mock_body=mock_body,
+            modify_request_headers=modify_request_headers,
+            modify_response_headers=modify_response_headers,
+        )
+
+    @mcp.tool()
+    def list_intercept_rules() -> list[dict[str, Any]]:
+        """查看当前配置的全部动态拦截与改写规则 (InterceptRule)。
+
+        Returns:
+            拦截规则字典列表；无规则时固定返回 []。
+        """
+        return storage.list_intercept_rules()
+
+    @mcp.tool()
+    def clear_intercept_rules(rule_id: str | None = None) -> dict[str, Any]:
+        """清空全部动态拦截规则，或按指定 rule_id 移除单条规则。
+
+        Args:
+            rule_id: 可选的目标规则 ID；为空时清空全部规则。
+
+        Returns:
+            包含 cleared_count 与 target_rule_id 的清理结果字典。
+        """
+        return storage.clear_intercept_rules(rule_id=rule_id)
+
+
 def create_mcp_server(
     config: ServerConfig,
     storage: StorageBus | None = None,
     capture_manager: HttpCaptureManager | None = None,
+    replay_engine: FlowReplayEngine | None = None,
     lifecycle: LifecycleManager | None = None,
 ) -> FastMCP:
     """构建并初始化 FastMCP 服务实例、共享 SQLite WAL 数据总线与 MCP 工具集。
@@ -191,19 +279,21 @@ def create_mcp_server(
         config: 服务端运行配置对象。
         storage: 可选的外部 StorageBus 实例；未传入时根据 config 自动构建并初始化。
         capture_manager: 可选的外部 HttpCaptureManager 实例。
+        replay_engine: 可选的外部 FlowReplayEngine 实例。
         lifecycle: 可选的生命周期管理器；传入时自动注册子进程停止钩子。
 
     Returns:
         完成工具注册的 FastMCP 服务对象。
     """
-    # 1. 初始化共享 SQLite WAL 数据总线与抓包会话管理器
+    # 1. 初始化共享 SQLite WAL 数据总线与核心业务管理器
     bus = storage or StorageBus.from_config(config)
     bus.initialize()
     manager = capture_manager or HttpCaptureManager(storage=bus)
+    replayer = replay_engine or FlowReplayEngine(storage=bus)
     if lifecycle is not None:
         lifecycle.register(lambda: None if manager.stop_capture() else None)
 
-    # 2. 创建 FastMCP 主控实例并注册 HTTP 生命周期与检索工具
+    # 2. 创建 FastMCP 主控实例并注册各领域工具集
     mcp = FastMCP(
         name=SERVER_NAME,
         instructions=SERVER_INSTRUCTIONS,
@@ -212,4 +302,5 @@ def create_mcp_server(
         log_level=config.log_level,
     )
     _register_http_tools(mcp=mcp, storage=bus, manager=manager)
+    _register_manipulation_tools(mcp=mcp, storage=bus, replay_engine=replayer)
     return mcp
