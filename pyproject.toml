@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcp-server-traffic-inspector"
+name = "atengk-mcp-server-traffic-inspector"
 version = "0.1.0"
 description = "专为 AI Agent 打造的网络流量抓包、会话检索、链路质量诊断、请求重放与规则 Mock 的全功能 MCP Server"
 readme = "README.md"
@@ -45,9 +45,12 @@ dependencies = [
 Homepage = "https://github.com/atengk/mcp-server-traffic-inspector"
 Repository = "https://github.com/atengk/mcp-server-traffic-inspector.git"
 Issues = "https://github.com/atengk/mcp-server-traffic-inspector/issues"
+Documentation = "https://github.com/atengk/mcp-server-traffic-inspector#readme"
+PyPI = "https://pypi.org/project/atengk-mcp-server-traffic-inspector/"
 
 [project.scripts]
 mcp-server-traffic-inspector = "mcp_server_traffic_inspector.__main__:main"
+atengk-mcp-server-traffic-inspector = "mcp_server_traffic_inspector.__main__:main"
 
 [dependency-groups]
 dev = [
