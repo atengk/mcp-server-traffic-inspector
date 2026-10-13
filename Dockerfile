@@ -31,9 +31,16 @@ COPY src/ ./src/
 
 RUN uv pip install --system --no-cache .
 
-# 8000: MCP Server SSE 监听端口
+# 8000: MCP Server SSE/Streamable-HTTP 监听端口
 # 8080: mitmdump HTTP/HTTPS 抓包代理默认端口
+ENV MCP_TRAFFIC_INSPECTOR_TRANSPORT=sse \
+    MCP_TRAFFIC_INSPECTOR_HOST=0.0.0.0 \
+    MCP_TRAFFIC_INSPECTOR_PORT=8000
+
 EXPOSE 8000 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["mcp-server-traffic-inspector", "--check"]
 
 ENTRYPOINT ["mcp-server-traffic-inspector"]
 CMD ["--transport", "sse", "--host", "0.0.0.0", "--port", "8000"]

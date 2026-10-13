@@ -80,15 +80,34 @@ uv run mcp-server-traffic-inspector
 }
 ```
 
-#### 方式 B：远程服务器 `sse` 模式 / Docker 容器部署
+#### 方式 B：远程服务器 `sse` / `streamable-http` 模式与 Docker 容器部署
 
 ```bash
 # 直接命令行以 SSE 模式启动 (监听 8000 端口)
 uv run mcp-server-traffic-inspector --transport sse --host 0.0.0.0 --port 8000
 
+# 执行环境自检 (检查 mitmdump、tshark、CA 证书与临时目录状态)
+uv run mcp-server-traffic-inspector --check
+
 # 或使用 Docker 容器运行 (8000 为 MCP SSE 端口，8080 为 HTTP/HTTPS 代理端口)
 docker run -d --name traffic-inspector -p 8000:8000 -p 8080:8080 ghcr.io/atengk/mcp-server-traffic-inspector:latest
 ```
+
+### 3. CLI 参数与环境变量 (`MCP_TRAFFIC_INSPECTOR_*`)
+
+参数优先级：**CLI 命令行参数 > 环境变量 > 默认值**。
+
+| CLI 参数 | 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `-h, --help` | - | - | 查看完整命令行帮助信息并退出 |
+| `-v, --version` | - | - | 查看当前版本号并退出 |
+| `--check` / `--doctor` | - | `False` | 运行环境依赖自检探针（检测 `mitmdump`、`tshark`、CA 证书与存储权限） |
+| `-t, --transport` | `MCP_TRAFFIC_INSPECTOR_TRANSPORT` | `stdio` | 传输模式：`stdio`、`sse`、`streamable-http` |
+| `--host` | `MCP_TRAFFIC_INSPECTOR_HOST` | `127.0.0.1` | `sse` / `streamable-http` 绑定监听地址 |
+| `-p, --port` | `MCP_TRAFFIC_INSPECTOR_PORT` | `8000` | `sse` / `streamable-http` 绑定监听端口 |
+| `--tshark-path` | `MCP_TRAFFIC_INSPECTOR_TSHARK_PATH` | 自动探测 | 自定义 `tshark` 可执行文件绝对路径 |
+| `--db-path` | `MCP_TRAFFIC_INSPECTOR_DB_PATH` | 系统临时目录 | 自定义 SQLite 数据库路径（显式指定时退出不自动删除） |
+| `--log-level` | `MCP_TRAFFIC_INSPECTOR_LOG_LEVEL` | `INFO` | 日志级别：`DEBUG`、`INFO`、`WARNING`、`ERROR` |
 
 ---
 
