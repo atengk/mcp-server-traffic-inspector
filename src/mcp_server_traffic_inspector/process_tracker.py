@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import PurePath, PureWindowsPath
 from typing import Any
 
 import psutil
@@ -193,7 +193,19 @@ class ProcessFamilyDetector:
     """负责解析目标主进程与其合法派生子进程家族 (ProcessFamily)。"""
 
     @staticmethod
-    def is_path_allowed(child_exe: str, root_dir: str) -> bool:
+    def _to_pure_path(path_str: str) -> PurePath:
+        """根据路径特征将其转换为 PureWindowsPath 或通用 PurePath。
+
+        若包含反斜杠或形如 C: 的驱动器前缀，优先转为 PureWindowsPath，
+        以保障在非 Windows 系统（如 Linux CI）上也能准确按层级解析。
+        """
+        clean = path_str.strip()
+        if "\\" in clean or (len(clean) >= 2 and clean[1] == ":"):
+            return PureWindowsPath(clean)
+        return PurePath(clean)
+
+    @classmethod
+    def is_path_allowed(cls, child_exe: str, root_dir: str) -> bool:
         """判定子进程的可执行文件路径是否位于主程序所在的根目录树内。
 
         避免微信点击外链拉起外部 Chrome/Edge 时被纳入流量统计。
@@ -208,8 +220,15 @@ class ProcessFamilyDetector:
         if not child_exe or not root_dir:
             return False
         try:
-            child_p = Path(child_exe).resolve()
-            root_p = Path(root_dir).resolve()
+            child_p = cls._to_pure_path(child_exe)
+            root_p = cls._to_pure_path(root_dir)
+            # 在 Windows 路径语义下进行大小写无关的层级包含判定
+            if isinstance(child_p, PureWindowsPath) and isinstance(root_p, PureWindowsPath):
+                child_parts = [p.lower() for p in child_p.parts]
+                root_parts = [p.lower() for p in root_p.parts]
+                if len(child_parts) < len(root_parts):
+                    return False
+                return child_parts[: len(root_parts)] == root_parts
             return child_p.is_relative_to(root_p)
         except (ValueError, OSError):
             return False
@@ -239,15 +258,18 @@ class ProcessFamilyDetector:
 
         # 1. 规范化并定位候选主进程
         if process_path and process_path.strip():
-            clean_path = str(Path(process_path.strip()).resolve()).lower()
-            root_dir = str(Path(process_path.strip()).resolve().parent)
+            raw_path = process_path.strip()
+            pure_root = self._to_pure_path(raw_path)
+            clean_path = str(pure_root).lower()
+            root_dir = str(pure_root.parent)
             for p in snapshot:
-                p_exe = str(Path(p.exe_path).resolve()).lower() if p.exe_path else ""
+                p_pure = self._to_pure_path(p.exe_path) if p.exe_path else None
+                p_exe = str(p_pure).lower() if p_pure else ""
                 if p_exe == clean_path:
                     matched_roots.append(p)
                     break
                 # 若无权限获取 exe_path，兜底匹配名称
-                if not p_exe and p.name.lower() == Path(clean_path).name.lower():
+                if not p_exe and p.name.lower() == pure_root.name.lower():
                     matched_roots.append(p)
 
         elif process_name and process_name.strip():
@@ -269,7 +291,7 @@ class ProcessFamilyDetector:
         primary_root = matched_roots[0]
         root_pid = primary_root.pid
         if not root_dir and primary_root.exe_path:
-            root_dir = str(Path(primary_root.exe_path).resolve().parent)
+            root_dir = str(self._to_pure_path(primary_root.exe_path).parent)
         family_pids = {root_pid}
         members_map: dict[int, ProcessInfo] = {root_pid: primary_root}
 
