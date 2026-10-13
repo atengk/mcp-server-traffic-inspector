@@ -295,8 +295,13 @@ def _register_pcap_tools(
         bpf_filter: str | None = None,
         max_packets: int = 2000,
         duration_seconds: int = 60,
+        process_path: str | None = None,
+        process_name: str | None = None,
+        target_pids: list[int] | None = None,
+        include_child_processes: bool = True,
+        keep_raw_pcap: bool = False,
     ) -> dict[str, Any]:
-        """在指定网卡上启动原始网络层数据包捕获 (PcapCapture)，受双重熔断阈值保护。
+        """在指定网卡启动原始网络层数据包捕获 (PcapCapture)，支持进程树过滤与多服务器拓扑审计。
 
         Args:
             interface: 网卡索引或名称，默认 1。
@@ -304,6 +309,11 @@ def _register_pcap_tools(
             bpf_filter: 可选的 Berkeley Packet Filter 表达式（如 'tcp and port 443'）。
             max_packets: 最大抓包数熔断上限，默认 2000 包。
             duration_seconds: 最大抓包时长熔断上限，默认 60 秒。
+            process_path: 可选的目标可执行文件绝对路径（如 'C:\\Program Files\\...\\Weixin.exe'）。
+            process_name: 可选的目标进程名称通配符（如 'Weixin*.exe'）。
+            target_pids: 可选的显式指定目标 PID 列表。
+            include_child_processes: 是否递归追踪目标进程的所有派生子进程，默认 True。
+            keep_raw_pcap: 是否保留全量中间抓包文件，默认 False（自动清理）。
 
         Returns:
             包含状态、网卡、产出文件绝对路径与熔断限制的字典。
@@ -314,6 +324,11 @@ def _register_pcap_tools(
             bpf_filter=bpf_filter,
             max_packets=max_packets,
             duration_seconds=duration_seconds,
+            process_path=process_path,
+            process_name=process_name,
+            target_pids=target_pids,
+            include_child_processes=include_child_processes,
+            keep_raw_pcap=keep_raw_pcap,
         )
 
     @mcp.tool()

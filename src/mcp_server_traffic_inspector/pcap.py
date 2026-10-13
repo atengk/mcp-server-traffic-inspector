@@ -21,6 +21,16 @@ from uuid import uuid4
 from mcp_server_traffic_inspector.capture_manager import WorkerProcessProtocol
 from mcp_server_traffic_inspector.config import LOGGER_NAME
 from mcp_server_traffic_inspector.doctor import resolve_tshark_path
+from mcp_server_traffic_inspector.pcap_slicer import (
+    CaptureSidecar,
+    build_slice_display_filter,
+    slice_pcap_file,
+)
+from mcp_server_traffic_inspector.process_tracker import (
+    ProcessFamilyTracker,
+    ProcessInfo,
+    SocketEntry,
+)
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -214,6 +224,8 @@ class PcapCaptureManager:
         command_runner: Callable[[list[str]], str] | None = None,
         process_spawner: Callable[[list[str], dict[str, str]], WorkerProcessProtocol] | None = None,
         default_output_dir: Path | None = None,
+        snapshot_fetcher: Callable[[], list[ProcessInfo]] | None = None,
+        socket_fetcher: Callable[[], list[SocketEntry]] | None = None,
     ) -> None:
         """初始化 PCAP 捕获与分析管理器。
 
@@ -222,16 +234,26 @@ class PcapCaptureManager:
             command_runner: 可选的同步命令执行器（供测试注入），默认调用 subprocess.run。
             process_spawner: 可选的子进程启动器函数（供测试注入），默认调用 subprocess.Popen。
             default_output_dir: 默认抓包产出文件保存目录，为 None 时使用系统临时目录。
+            snapshot_fetcher: 可选的进程快照获取器函数（供测试注入）。
+            socket_fetcher: 可选的活跃套接字获取器函数（供测试注入）。
         """
         self._explicit_path = tshark_path
         self._runner = command_runner or self._run_command_sync
         self._spawner = process_spawner or _default_spawner
         self._default_dir = (default_output_dir or Path(tempfile.gettempdir())).resolve()
+        self._snapshot_fetcher = snapshot_fetcher
+        self._socket_fetcher = socket_fetcher
 
         self._process: WorkerProcessProtocol | None = None
         self._active_output_file: str | None = None
         self._active_interface: int | str | None = None
         self._started_at: float | None = None
+
+        # 进程感知抓包状态
+        self._active_tracker: ProcessFamilyTracker | None = None
+        self._is_process_capture: bool = False
+        self._active_final_target: Path | None = None
+        self._active_keep_raw: bool = False
 
     def _run_command_sync(self, cmd: list[str]) -> str:
         try:
@@ -279,8 +301,15 @@ class PcapCaptureManager:
         bpf_filter: str | None = None,
         max_packets: int = 2000,
         duration_seconds: int = 60,
+        process_path: str | None = None,
+        process_name: str | None = None,
+        target_pids: list[int] | None = None,
+        include_child_processes: bool = True,
+        keep_raw_pcap: bool = False,
     ) -> dict[str, Any]:
         """在指定网卡启动带双重安全熔断阈值的原始报文捕获 (PcapCapture)。
+
+        支持基于进程路径、进程名称或显式 PID 家族树追踪与后处理时空切片。
 
         Args:
             interface: 网卡索引或名称，默认 1。
@@ -288,9 +317,14 @@ class PcapCaptureManager:
             bpf_filter: 可选的 BPF 抓包过滤表达式（如 'tcp port 80'）。
             max_packets: 最大抓包数熔断上限，默认 2000 包。
             duration_seconds: 最大抓包时长熔断上限，默认 60 秒。
+            process_path: 可选的目标可执行文件绝对路径。
+            process_name: 可选的目标进程名称通配符（如 'Weixin*.exe'）。
+            target_pids: 可选的显式指定目标 PID 列表。
+            include_child_processes: 是否递归追踪目标进程的所有派生子进程，默认 True。
+            keep_raw_pcap: 是否保留全量中间抓包文件，默认 False（自动清理）。
 
         Returns:
-            包含 status、interface、output_file 与 limits 阈值的字典。
+            包含 status、interface、output_file、limits 及 process_filter 的字典。
         """
         # 1. 若已有运行中的实时抓包子进程，先执行安全停止
         if self._process is not None and self._process.poll() is None:
@@ -308,13 +342,37 @@ class PcapCaptureManager:
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
+        is_process_mode = bool(process_path or process_name or target_pids)
+        self._is_process_capture = is_process_mode
+        self._active_final_target = target_path
+        self._active_keep_raw = keep_raw_pcap
+
+        # 在进程抓包模式下，底层 tshark 捕获到中间原始文件
+        capture_file = (
+            target_path.parent / f"raw_{target_path.name}"
+            if is_process_mode
+            else target_path
+        )
+
+        if is_process_mode:
+            self._active_tracker = ProcessFamilyTracker(
+                process_path=process_path,
+                process_name=process_name,
+                target_pids=target_pids,
+                include_child_processes=include_child_processes,
+                poll_interval=0.1,
+                snapshot_fetcher=self._snapshot_fetcher,
+                socket_fetcher=self._socket_fetcher,
+            )
+            self._active_tracker.start()
+
         # 3. 构建并启动实施双重安全熔断的 tshark 子进程
         cmd = [
             str(tshark_bin),
             "-i",
             str(interface),
             "-w",
-            str(target_path),
+            str(capture_file),
             "-c",
             str(max(1, int(max_packets))),
             "-a",
@@ -325,11 +383,11 @@ class PcapCaptureManager:
             cmd.extend(["-f", bpf_filter.strip()])
 
         self._process = self._spawner(cmd, dict(os.environ))
-        self._active_output_file = str(target_path)
+        self._active_output_file = str(capture_file)
         self._active_interface = interface
         self._started_at = time.monotonic()
 
-        return {
+        result: dict[str, Any] = {
             "status": "capturing",
             "interface": interface,
             "output_file": str(target_path),
@@ -338,12 +396,21 @@ class PcapCaptureManager:
                 "duration_seconds": int(duration_seconds),
             },
         }
+        if is_process_mode:
+            result["process_filter"] = {
+                "process_path": process_path,
+                "process_name": process_name,
+                "target_pids": target_pids,
+                "include_child_processes": include_child_processes,
+            }
+
+        return result
 
     def stop_capture(self) -> dict[str, Any]:
-        """优雅停止当前正在运行的实时 PCAP 抓包子进程。
+        """优雅停止当前正在运行的实时 PCAP 抓包子进程，并执行切片与元数据落盘。
 
         Returns:
-            包含 status ("stopped")、pcap_file 路径与 packet_count 包数的字典。
+            包含 status ("stopped")、pcap_file 路径、packet_count 及拓扑元数据的字典。
         """
         # 1. 安全终止 tshark 子进程
         proc = self._process
@@ -358,12 +425,56 @@ class PcapCaptureManager:
             except Exception as exc:
                 logger.warning("终止 tshark 实时抓包子进程异常: %s", exc)
 
-        pcap_file = self._active_output_file
+        raw_capture_file = self._active_output_file
+        final_target = self._active_final_target
+        is_process_mode = self._is_process_capture
+        tracker = self._active_tracker
+        keep_raw = self._active_keep_raw
+
         self._active_output_file = None
         self._active_interface = None
         self._started_at = None
+        self._active_tracker = None
+        self._is_process_capture = False
+        self._active_final_target = None
+        self._active_keep_raw = False
 
-        # 2. 统计已捕获的数据包数量
+        process_summary: dict[str, Any] | None = None
+        server_topology: list[dict[str, Any]] = []
+
+        # 2. 若启用了进程感知模式，执行时空切片并保存 Sidecar
+        if is_process_mode and tracker is not None and final_target is not None:
+            family, timeline = tracker.stop()
+            process_summary = family.to_dict()
+            server_topology = timeline.export_server_topology(family.all_pids)
+
+            ports = timeline.get_active_ports(family.all_pids)
+            display_filter = build_slice_display_filter(ports)
+
+            if raw_capture_file and Path(raw_capture_file).is_file():
+                try:
+                    tshark_bin = self._resolve_binary()
+                    slice_pcap_file(
+                        raw_pcap_path=raw_capture_file,
+                        target_pcap_path=final_target,
+                        display_filter=display_filter,
+                        tshark_bin=tshark_bin,
+                        runner=self._runner,
+                        keep_raw_pcap=keep_raw,
+                    )
+                except Exception as exc:
+                    logger.warning("执行 PCAP 时空切片异常: %s", exc)
+
+            CaptureSidecar.save(
+                pcap_path=final_target,
+                process_family=family,
+                timeline=timeline,
+            )
+            pcap_file = str(final_target)
+        else:
+            pcap_file = raw_capture_file
+
+        # 3. 统计最终切片文件的报文数量
         packet_count = 0
         if pcap_file and Path(pcap_file).is_file():
             try:
@@ -375,11 +486,16 @@ class PcapCaptureManager:
             except Exception as exc:
                 logger.debug("统计 PCAP 文件包数失败: %s", exc)
 
-        return {
+        res: dict[str, Any] = {
             "status": "stopped",
             "pcap_file": pcap_file,
             "packet_count": packet_count,
         }
+        if is_process_mode:
+            res["process_summary"] = process_summary
+            res["server_topology"] = server_topology
+
+        return res
 
     def analyze_pcap(
         self,
@@ -438,9 +554,17 @@ class PcapCaptureManager:
         output = self._runner(cmd)
         tsv_lines = [line for line in output.splitlines() if line.strip()]
 
-        # 3. 汇总聚合指标并返回
-        return parse_tshark_fields_output(
+        # 3. 汇总聚合指标
+        analysis = parse_tshark_fields_output(
             tsv_lines=tsv_lines,
             file_path=str(path_obj),
             total_packets=len(tsv_lines),
         )
+
+        # 4. 若存在同名 .pcap.meta.json 伴随元数据，自动挂载多服务器拓扑与进程画像
+        sidecar_meta = CaptureSidecar.load(path_obj)
+        if sidecar_meta:
+            analysis["process_summary"] = sidecar_meta.get("process_family")
+            analysis["server_topology"] = sidecar_meta.get("server_topology", [])
+
+        return analysis

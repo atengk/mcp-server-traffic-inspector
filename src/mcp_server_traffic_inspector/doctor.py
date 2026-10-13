@@ -248,16 +248,29 @@ def _check_mitmdump() -> ComponentCheckResult:
         )
 
 
+def is_admin_user() -> bool:
+    """探测当前进程是否具备 Windows 管理员权限或 POSIX root 权限。"""
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return os.getuid() == 0 if hasattr(os, "getuid") else False
+
+
 def _check_tshark(explicit_path: str | None) -> ComponentCheckResult:
     resolved = resolve_tshark_path(explicit_path=explicit_path)
     if resolved is not None:
         version_line = _probe_binary_version(resolved)
+        is_admin = is_admin_user()
+        admin_note = " (管理员权限就绪)" if is_admin else " (普通权限，已启用时空切片模式)"
         return ComponentCheckResult(
             status="ok",
             required=bool(explicit_path),
-            message="tshark 协议分析引擎可用",
+            message=f"tshark 协议分析引擎可用{admin_note}",
             path=str(resolved),
             version=version_line or "available",
+            extra={"is_admin": is_admin},
         )
 
     if explicit_path:

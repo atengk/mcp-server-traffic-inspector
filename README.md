@@ -149,6 +149,21 @@ uv run mcp-server-traffic-inspector
 
 ---
 
+### 依赖要求 (Prerequisites)
+
+| 功能模块 | Windows 依赖 | Linux 依赖 | macOS 依赖 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **HTTP 代理抓包 (L7)** | Python 3.11+ (内置 mitmproxy) | Python 3.11+ | Python 3.11+ | 纯 Python 用户态实现，开箱即用 |
+| **底层 PCAP 抓包 (L3/L4)** | Wireshark + Npcap | tshark + libpcap | Wireshark + libpcap | 需底层网络驱动支持 |
+| **进程感知与拓扑审计** | Windows 原生 (含动态切片) | 优雅降级为网卡抓包 | 优雅降级为网卡抓包 | 自动发现进程树与多服务器画像 |
+
+#### 抓包引擎快速安装命令
+- **Windows**: `winget install WiresharkFoundation.Wireshark`（自动包含 tshark 与 Npcap）
+- **Ubuntu/Debian**: `sudo apt-get install -y tshark`
+- **macOS**: `brew install wireshark`
+
+---
+
 ## 🧰 MCP Tools 能力矩阵 (18 Tools)
 
 本服务完整实现了 **18 个 MCP Tools**，覆盖网络流量观测与排障的全生命周期：
@@ -161,11 +176,11 @@ uv run mcp-server-traffic-inspector
 | **流量检索与详情** | `list_http_flows` | `session_id`, `host`, `status_code`, `status_family`, `method`, `min_duration_ms`, `sort_by`, `limit`, `offset` | 多维条件分页检索请求流摘要；**绝不携带任何 Body，保证 LLM 上下文轻量** |
 | | `get_http_flow_detail` | `flow_id`, `max_body_chars=2048`, `dump_body_to_file=False` | 查看完整 Headers 与截断文本预览；支持强制落盘无损原始文件 |
 | **全栈分析与诊断** | `analyze_http_traffic` | `session_id=None`（默认最近会话） | 聚合慢请求 Top 5、互斥状态码分布及精确占比、高频端点 Top 10 与最大 Payload Top 3 |
-| | `analyze_pcap_file` | `file_path`, `display_filter=None`, `limit=50` | 深度分析 PCAP 协议占比、TCP 重传率、RTT 时延极值与 DNS 解析统计 |
+| | `analyze_pcap_file` | `file_path`, `display_filter=None`, `limit=50` | 深度分析 PCAP 协议占比、TCP 重传率、RTT 与 DNS 统计；自动挂载元数据展示多服务器拓扑与进程矩阵 |
 | | `diagnose_network_session` | `session_type="http"\|"pcap"`, `target=None` | 自动计算链路健康度评分（0~100），输出明确异常清单与排障建议 |
 | **PCAP 原始抓包** | `list_network_interfaces` | 无 | 解析网卡索引与描述信息（无可用接口时优雅返回 `[]`） |
-| | `start_pcap_capture` | `interface=1`, `output_path=None`, `bpf_filter=None`, `max_packets=2000`, `duration_seconds=60` | 启动网卡实时抓包，强制实施双重安全熔断阈值保护 |
-| | `stop_pcap_capture` | 无 | 停止 PCAP 抓包并返回生成的 `.pcap` 文件绝对路径与捕获包数 |
+| | `start_pcap_capture` | `interface=1`, `process_path=None`, `process_name=None`, `target_pids=None`, `bpf_filter=None`, `keep_raw_pcap=False` | 启动网卡或目标进程树实时抓包，支持动态端口时空切片、多服务器拓扑审计与双重安全熔断 |
+| | `stop_pcap_capture` | 无 | 停止抓包并返回生成的 `.pcap` 文件、数据包统计、进程家族与多服务器拓扑画像 |
 | **重放与规则 Mock** | `replay_http_request` | `flow_id`, `modify_headers=None`, `modify_body=None`, `modify_url=None` | 基于历史 Flow 参数变异重放，无损读取原始大请求体并计算新旧响应 Diff |
 | | `add_intercept_rule` | `url_pattern`, `action="mock"\|"modify"`, `mock_status=200`, `mock_headers`, `mock_body`, `modify_request_headers`, `modify_response_headers` | 下发非阻塞动态规则，支持 Mock 短路返回与请求/响应头动态改写 |
 | | `list_intercept_rules` | 无 | 查看当前生效的所有动态拦截与改写规则清单 |

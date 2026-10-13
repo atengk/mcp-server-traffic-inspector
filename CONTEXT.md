@@ -31,3 +31,24 @@ _Avoid_: Retry (重试), Forward (转发), ProxyPass (代理透传)
 **SessionDiagnosis (会话诊断)**:
 结合应用层 `HttpFlow` 统计指标或网络层 `PcapCapture` 协议指标，生成的结构化健康度评估与异常根因结论。
 _Avoid_: LogAnalysis (日志分析), Trace (链路追踪)
+
+**ProcessFamily (进程家族)**:
+由指定目标可执行文件作为根进程及其派生出的全部合法子进程构成的动态进程集合。
+_Avoid_: ProcessGroup (进程组), SubprocessList (子进程列表), TaskList (任务列表)
+
+**SocketTimeline (套接字时序流)**:
+在抓包生命周期内记录的本地与远端套接字端点、时间戳与进程 PID 绑定关系的时序数据集合。
+_Avoid_: PortSnapshot (端口快照), ConnectionHistory (连接历史), SocketCache (套接字缓存)
+
+**CaptureSidecar (捕获伴随元数据)**:
+与抓包文件伴随落盘的结构化元数据文件，持久化存储套接字时序与进程拓扑信息供离线分析挂载。
+_Avoid_: AuxiliaryFile (辅助文件), TraceMeta (追踪元数据), LogIndex (日志索引)
+
+**ServerTopology (多服务器连接拓扑)**:
+归属于特定进程家族或抓包会话的全部远端通信端点画像，按服务 IP、端口、域名/ISP 及网络质量聚合的多维视图。
+_Avoid_: NetworkGraph (网络图谱), ServiceMap (服务地图), NodeList (节点列表)
+
+**ProcessTrafficMatrix (进程通信行为矩阵)**:
+按进程家族内各主/子进程细分统计的流量消耗、报文计数与协议分布多维矩阵视图。
+_Avoid_: ProcessStats (进程统计), ProcessBreakdown (进程细分)
+
