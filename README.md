@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="https://pypi.org/project/atengk-mcp-server-traffic-inspector/">
-    <img src="https://img.shields.io/pypi/v/atengk-mcp-server-traffic-inspector?style=flat-square&color=blue" alt="PyPI Version" />
+    <img src="https://img.shields.io/pypi/v/atengk-mcp-server-traffic-inspector?logo=pypi&amp;logoColor=white&amp;style=flat-square" alt="PyPI Version" />
   </a>
   <a href="https://pypi.org/project/atengk-mcp-server-traffic-inspector/">
-    <img src="https://img.shields.io/pypi/pyversions/atengk-mcp-server-traffic-inspector?style=flat-square" alt="Python Versions" />
+    <img src="https://img.shields.io/pypi/pyversions/atengk-mcp-server-traffic-inspector?logo=python&amp;logoColor=white&amp;style=flat-square" alt="Python Versions" />
   </a>
   <a href="https://github.com/atengk/mcp-server-traffic-inspector/actions/workflows/ci.yml">
     <img src="https://img.shields.io/github/actions/workflow/status/atengk/mcp-server-traffic-inspector/ci.yml?branch=main&label=CI&style=flat-square" alt="CI Status" />
