@@ -1,4 +1,4 @@
-"""FastMCP 服务主控底座与进程生命周期清理编排模块。
+"""FastMCP 服务主控底座、MCP 工具注册与进程生命周期清理编排模块。
 
 @author Ateng
 @since 2026-10-13
@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from mcp_server_traffic_inspector.capture_manager import HttpCaptureManager
 from mcp_server_traffic_inspector.config import LOGGER_NAME, ServerConfig
-from mcp_server_traffic_inspector.storage import StorageBus
+from mcp_server_traffic_inspector.storage import DEFAULT_PREVIEW_CHARS, StorageBus
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -54,24 +56,154 @@ class LifecycleManager:
                 logger.warning("执行退出清理回调时发生异常: %s", exc)
 
 
+def _register_http_tools(
+    mcp: FastMCP,
+    storage: StorageBus,
+    manager: HttpCaptureManager,
+) -> None:
+    @mcp.tool()
+    def start_http_capture(
+        port: int = 8080,
+        listen_host: str = "0.0.0.0",
+        filter_host: str | None = None,
+        ssl_insecure: bool = True,
+    ) -> dict[str, Any]:
+        """启动受控 mitmdump 后台代理会话 (CaptureSession) 捕获 HTTP/HTTPS 流量。
+
+        Args:
+            port: 代理监听端口，默认 8080。
+            listen_host: 代理监听地址，默认 "0.0.0.0"。
+            filter_host: 可选的目标采集域名（非目标域名正常转发，仅目标域名写入数据库）。
+            ssl_insecure: 是否忽略上游服务端 TLS 证书错误，默认 True。
+
+        Returns:
+            包含运行状态、监听地址端口、session_id、数据库路径与 CA 证书路径的字典。
+        """
+        return manager.start_capture(
+            port=port,
+            listen_host=listen_host,
+            filter_host=filter_host,
+            ssl_insecure=ssl_insecure,
+        )
+
+    @mcp.tool()
+    def stop_http_capture() -> dict[str, Any]:
+        """停止当前正在运行的 HTTP/HTTPS 抓包代理会话并返回捕获统计。
+
+        Returns:
+            包含 status ("stopped")、session_id 与 total_captured_flows 的字典。
+        """
+        return manager.stop_capture()
+
+    @mcp.tool()
+    def get_capture_status() -> dict[str, Any]:
+        """查询当前 HTTP 抓包代理运行状态、会话 ID、已捕获流数量与运行时长。
+
+        Returns:
+            包含 is_capturing、listen_host、port、session_id、flow_count 与 uptime_seconds 的字典。
+        """
+        return manager.get_status()
+
+    @mcp.tool()
+    def list_http_flows(
+        limit: int = 20,
+        offset: int = 0,
+        session_id: str | None = None,
+        host: str | None = None,
+        status_code: int | None = None,
+        status_family: str | None = None,
+        method: str | None = None,
+        min_duration_ms: float | None = None,
+        sort_by: str = "timestamp",
+    ) -> dict[str, Any]:
+        """按多维条件分页检索已捕获的 HttpFlow 轻量元数据列表（不含 BodyPayload）。
+
+        Args:
+            limit: 单页返回最大条数，默认 20。
+            offset: 分页起始偏移量，默认 0。
+            session_id: 可选抓包会话 ID；未指定时检索全部已录制会话。
+            host: 按目标域名子串过滤（不区分大小写）。
+            status_code: 按精确 HTTP 状态码过滤。
+            status_family: 按状态码族过滤（可选: 2xx, 3xx, 4xx, 5xx, error）。
+            method: 按 HTTP 方法过滤（如 GET、POST）。
+            min_duration_ms: 按最小请求耗时（毫秒）过滤慢请求。
+            sort_by: 排序字段（timestamp、duration_ms、size）。
+
+        Returns:
+            包含 total、session_id 与 flows 列表的字典；无匹配数据时 flows 返回 []。
+        """
+        return storage.list_http_flows(
+            limit=limit,
+            offset=offset,
+            session_id=session_id,
+            host=host,
+            status_code=status_code,
+            status_family=status_family,
+            method=method,
+            min_duration_ms=min_duration_ms,
+            sort_by=sort_by,
+        )
+
+    @mcp.tool()
+    def get_http_flow_detail(
+        flow_id: str,
+        include_headers: bool = True,
+        include_body: bool = True,
+        max_body_chars: int = DEFAULT_PREVIEW_CHARS,
+        dump_body_to_file: bool = False,
+    ) -> dict[str, Any]:
+        """查询单条 HttpFlow 的完整请求/响应头与截断预览 BodyPayload，支持导出完整载荷文件。
+
+        Args:
+            flow_id: 目标 HttpFlow 的唯一 ID。
+            include_headers: 是否包含请求与响应 Headers，默认 True。
+            include_body: 是否包含请求与响应 BodyPayload 预览，默认 True。
+            max_body_chars: 文本载荷预览最大截断字符数，默认 2048。
+            dump_body_to_file: 是否将完整原始载荷写出为本地文件并返回绝对路径，默认 False。
+
+        Returns:
+            包含请求行、状态码、耗时、Headers、截断预览与文件路径的详情字典。
+
+        Raises:
+            ValueError: 当指定的 flow_id 不存在时抛出。
+        """
+        detail = storage.get_http_flow_detail(
+            flow_id,
+            include_headers=include_headers,
+            include_body=include_body,
+            max_body_chars=max_body_chars,
+            dump_body_to_file=dump_body_to_file,
+        )
+        if detail is None:
+            raise ValueError(f"未找到指定的 HttpFlow 记录: {flow_id}")
+        return detail
+
+
 def create_mcp_server(
     config: ServerConfig,
     storage: StorageBus | None = None,
+    capture_manager: HttpCaptureManager | None = None,
+    lifecycle: LifecycleManager | None = None,
 ) -> FastMCP:
-    """构建并初始化 FastMCP 服务实例与共享 SQLite WAL 数据总线。
+    """构建并初始化 FastMCP 服务实例、共享 SQLite WAL 数据总线与 MCP 工具集。
 
     Args:
         config: 服务端运行配置对象。
         storage: 可选的外部 StorageBus 实例；未传入时根据 config 自动构建并初始化。
+        capture_manager: 可选的外部 HttpCaptureManager 实例。
+        lifecycle: 可选的生命周期管理器；传入时自动注册子进程停止钩子。
 
     Returns:
-        初始化完成的 FastMCP 服务对象。
+        完成工具注册的 FastMCP 服务对象。
     """
-    # 1. 初始化共享 SQLite WAL 数据总线
+    # 1. 初始化共享 SQLite WAL 数据总线与抓包会话管理器
     bus = storage or StorageBus.from_config(config)
     bus.initialize()
+    manager = capture_manager or HttpCaptureManager(storage=bus)
+    if lifecycle is not None:
+        lifecycle.register(lambda: None if manager.stop_capture() else None)
 
-    # 2. 创建并配置 FastMCP 主控实例
+    # 2. 创建 FastMCP 主控实例并注册 HTTP 生命周期与检索工具
     mcp = FastMCP(
         name=SERVER_NAME,
         instructions=SERVER_INSTRUCTIONS,
@@ -79,4 +211,5 @@ def create_mcp_server(
         port=config.port,
         log_level=config.log_level,
     )
+    _register_http_tools(mcp=mcp, storage=bus, manager=manager)
     return mcp

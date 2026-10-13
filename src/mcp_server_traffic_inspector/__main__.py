@@ -74,7 +74,7 @@ def main(
 
     # 4. 启动 FastMCP 服务并在退出时保障清理执行
     try:
-        mcp = create_mcp_server(config=config, storage=storage)
+        mcp = create_mcp_server(config=config, storage=storage, lifecycle=lifecycle)
         logger.info(
             "正在启动 %s (transport=%s, db=%s)",
             mcp.name,

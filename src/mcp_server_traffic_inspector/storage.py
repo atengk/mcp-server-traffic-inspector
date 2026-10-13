@@ -6,16 +6,36 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import sqlite3
+from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Literal
 
 from mcp_server_traffic_inspector.config import LOGGER_NAME, ServerConfig
 
 logger = logging.getLogger(LOGGER_NAME)
+
+MAX_INLINE_BODY_BYTES = 256 * 1024
+DEFAULT_PREVIEW_CHARS = 2048
+
+TEXTUAL_MIME_KEYWORDS = (
+    "text/",
+    "json",
+    "xml",
+    "javascript",
+    "ecmascript",
+    "x-www-form-urlencoded",
+    "graphql",
+    "yaml",
+    "csv",
+    "html",
+)
 
 SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS http_flows (
@@ -70,6 +90,58 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
 """
 
 
+def _extract_content_type(headers: Mapping[str, str] | None) -> str | None:
+    if not headers:
+        return None
+    for k, v in headers.items():
+        if k.lower() == "content-type" and v:
+            return v.strip()
+    return None
+
+
+def _is_binary_payload(raw_bytes: bytes, content_type: str | None) -> bool:
+    if not raw_bytes:
+        return False
+    if content_type:
+        ct_lower = content_type.lower()
+        if any(token in ct_lower for token in TEXTUAL_MIME_KEYWORDS):
+            return b"\x00" in raw_bytes[:1024]
+    if b"\x00" in raw_bytes[:1024]:
+        return True
+    try:
+        raw_bytes[:4096].decode("utf-8")
+        return False
+    except UnicodeDecodeError:
+        return True
+
+
+def _decode_preview(
+    raw_bytes: bytes,
+    is_binary: bool,
+    max_chars: int,
+) -> tuple[str, bool]:
+    if not raw_bytes:
+        return "", False
+    if is_binary:
+        summary = f"<binary payload: {len(raw_bytes)} bytes>"
+        return summary, False
+    decoded = raw_bytes.decode("utf-8", errors="replace")
+    if len(decoded) > max_chars:
+        return decoded[:max_chars], True
+    return decoded, False
+
+
+def _format_url(scheme: str, host: str, port: int, path: str) -> str:
+    default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    authority = host if default_port else f"{host}:{port}"
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    return f"{scheme}://{authority}{normalized_path}"
+
+
+def _format_iso_time(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
+
+
 @dataclass(frozen=True, slots=True)
 class StorageHealth:
     """SQLite WAL 共享数据总线健康度快照。
@@ -95,7 +167,8 @@ class StorageBus:
     """主控进程与抓包子进程共享的 SQLite WAL 数据总线管理器。
 
     负责初始化 WAL 并发模式与三张领域表（http_flows、http_bodies、intercept_rules），
-    提供存储层健康自检，并在进程退出时按策略回收临时数据库与分流载荷文件。
+    提供 HttpFlow / BodyPayload 保真入库、多维检索与防爆截断详情，
+    并在进程退出时按策略回收临时数据库与分流载荷文件。
     """
 
     def __init__(
@@ -131,6 +204,14 @@ class StorageBus:
             preserve_db=config.preserve_db,
         )
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=15.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        return conn
+
     def initialize(self) -> None:
         """创建数据库父目录与大载荷分流目录，开启 SQLite WAL 模式并建表。"""
         # 1. 确保数据库父目录与超大载荷分流目录存在
@@ -138,12 +219,437 @@ class StorageBus:
         self.bodies_dir.mkdir(parents=True, exist_ok=True)
 
         # 2. 连接 SQLite 并开启 WAL 与外键约束，执行核心 DDL
-        with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("PRAGMA foreign_keys=ON;")
+        with closing(self._connect()) as conn:
             conn.executescript(SCHEMA_DDL)
             conn.commit()
+
+    def _prepare_body_storage(
+        self,
+        flow_id: str,
+        direction: Literal["req", "resp"],
+        raw_bytes: bytes | None,
+        content_type: str | None,
+    ) -> tuple[str, bytes | None, int, str | None]:
+        payload = raw_bytes or b""
+        is_binary = _is_binary_payload(payload, content_type)
+        preview, _ = _decode_preview(payload, is_binary, DEFAULT_PREVIEW_CHARS)
+
+        if len(payload) > MAX_INLINE_BODY_BYTES:
+            self.bodies_dir.mkdir(parents=True, exist_ok=True)
+            spilled_path = (self.bodies_dir / f"{flow_id}_{direction}.bin").resolve()
+            spilled_path.write_bytes(payload)
+            return preview, None, int(is_binary), str(spilled_path)
+
+        return preview, payload, int(is_binary), None
+
+    def record_http_flow(
+        self,
+        *,
+        flow_id: str,
+        session_id: str,
+        timestamp: float,
+        method: str,
+        scheme: str,
+        host: str,
+        port: int,
+        path: str,
+        status_code: int | None = None,
+        duration_ms: float | None = None,
+        request_headers: Mapping[str, str] | None = None,
+        response_headers: Mapping[str, str] | None = None,
+        request_content_type: str | None = None,
+        response_content_type: str | None = None,
+        request_body: bytes | None = None,
+        response_body: bytes | None = None,
+        has_error: bool = False,
+        error_message: str | None = None,
+    ) -> str:
+        """将捕获的 HttpFlow 元数据与 BodyPayload 保真写入 SQLite WAL 数据总线。
+
+        对于不大于 256KB 的载荷直接存入 BLOB；超过 256KB 的载荷自动分流写入 bodies_dir 临时文件。
+
+        Args:
+            flow_id: 唯一流标识。
+            session_id: 归属的 CaptureSession 唯一标识。
+            timestamp: 请求发起时的 Unix 时间戳（秒）。
+            method: HTTP 请求方法（如 GET、POST）。
+            scheme: 协议方案（http 或 https）。
+            host: 目标主机域名或 IP。
+            port: 目标端口。
+            path: 请求路径（含 Query 参数）。
+            status_code: HTTP 响应状态码，请求异常未收到响应时可为 None。
+            duration_ms: 完整请求-响应耗时（毫秒）。
+            request_headers: 请求头字典。
+            response_headers: 响应头字典。
+            request_content_type: 请求 Content-Type，为 None 时自动从 request_headers 提取。
+            response_content_type: 响应 Content-Type，为 None 时自动从 response_headers 提取。
+            request_body: 解压后的原始请求体字节。
+            response_body: 解压后的原始响应体字节。
+            has_error: 是否发生传输或代理错误。
+            error_message: 错误详情描述。
+
+        Returns:
+            成功入库的 flow_id。
+        """
+        # 1. 归一化请求/响应头部与 Content-Type，并准备 BodyPayload 分流或内联存储
+        req_headers_dict = dict(request_headers or {})
+        resp_headers_dict = dict(response_headers or {})
+        req_ct = request_content_type or _extract_content_type(req_headers_dict)
+        resp_ct = response_content_type or _extract_content_type(resp_headers_dict)
+
+        req_bytes = request_body or b""
+        resp_bytes = response_body or b""
+        req_preview, req_blob, req_bin, req_path = self._prepare_body_storage(
+            flow_id, "req", req_bytes, req_ct
+        )
+        resp_preview, resp_blob, resp_bin, resp_path = self._prepare_body_storage(
+            flow_id, "resp", resp_bytes, resp_ct
+        )
+
+        # 2. 原子写入 http_flows 与 http_bodies 表
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO http_flows (
+                    id, session_id, timestamp, method, scheme, host, port, path,
+                    status_code, duration_ms, request_headers, response_headers,
+                    request_content_type, response_content_type,
+                    request_body_size, response_body_size, has_error, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    flow_id,
+                    session_id,
+                    timestamp,
+                    method.upper(),
+                    scheme.lower(),
+                    host,
+                    port,
+                    path,
+                    status_code,
+                    duration_ms,
+                    json.dumps(req_headers_dict, ensure_ascii=False),
+                    json.dumps(resp_headers_dict, ensure_ascii=False),
+                    req_ct,
+                    resp_ct,
+                    len(req_bytes),
+                    len(resp_bytes),
+                    int(has_error),
+                    error_message,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO http_bodies (
+                    flow_id, request_body_preview, response_body_preview,
+                    request_body, response_body,
+                    is_request_binary, is_response_binary,
+                    request_body_path, response_body_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    flow_id,
+                    req_preview,
+                    resp_preview,
+                    req_blob,
+                    resp_blob,
+                    req_bin,
+                    resp_bin,
+                    req_path,
+                    resp_path,
+                ),
+            )
+            conn.commit()
+
+        return flow_id
+
+    def count_flows(self, session_id: str | None = None) -> int:
+        """统计指定会话或全局已捕获的 HttpFlow 数量。
+
+        Args:
+            session_id: 可选的会话 ID；为 None 时统计全部会话。
+
+        Returns:
+            匹配的流记录总数。
+        """
+        with closing(self._connect()) as conn:
+            if session_id:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM http_flows WHERE session_id = ?;",
+                    (session_id,),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM http_flows;").fetchone()
+            return int(row[0]) if row else 0
+
+    def list_http_flows(
+        self,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        session_id: str | None = None,
+        host: str | None = None,
+        status_code: int | None = None,
+        status_family: str | None = None,
+        method: str | None = None,
+        min_duration_ms: float | None = None,
+        sort_by: str = "timestamp",
+    ) -> dict[str, Any]:
+        """按多维过滤条件分页查询轻量级 HttpFlow 列表（不含任何 Body 内容）。
+
+        Args:
+            limit: 单页最大返回条数，默认 20。
+            offset: 分页偏移量，默认 0。
+            session_id: 按抓包会话 ID 过滤。
+            host: 按域名子串（不区分大小写）过滤。
+            status_code: 按精确状态码过滤。
+            status_family: 按状态码族（2xx、3xx、4xx、5xx、error）过滤。
+            method: 按 HTTP 请求方法过滤（不区分大小写）。
+            min_duration_ms: 按最小请求耗时（毫秒）过滤。
+            sort_by: 排序字段（timestamp、duration_ms、size）。
+
+        Returns:
+            包含 total、session_id 与 flows 列表的字典；无匹配数据时 flows 固定为 []。
+        """
+        # 1. 组装参数化 WHERE 子句
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if host:
+            clauses.append("LOWER(host) LIKE ?")
+            params.append(f"%{host.strip().lower()}%")
+        if status_code is not None:
+            clauses.append("status_code = ?")
+            params.append(int(status_code))
+        if status_family:
+            fam = status_family.strip().lower()
+            if fam in {"2xx", "3xx", "4xx", "5xx"}:
+                base_code = int(fam[0]) * 100
+                clauses.append("status_code >= ? AND status_code < ?")
+                params.extend([base_code, base_code + 100])
+            elif fam == "error":
+                clauses.append("(has_error = 1 OR status_code >= 400)")
+        if method:
+            clauses.append("UPPER(method) = ?")
+            params.append(method.strip().upper())
+        if min_duration_ms is not None:
+            clauses.append("duration_ms >= ?")
+            params.append(float(min_duration_ms))
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        # 2. 解析安全排序规则
+        sort_map = {
+            "timestamp": "timestamp DESC",
+            "duration_ms": "COALESCE(duration_ms, 0) DESC, timestamp DESC",
+            "size": "(COALESCE(response_body_size, 0) + COALESCE(request_body_size, 0)) DESC",
+        }
+        order_sql = sort_map.get(sort_by.strip().lower(), "timestamp DESC")
+
+        # 3. 执行总数统计与分页元数据查询
+        with closing(self._connect()) as conn:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) FROM http_flows {where_sql};",
+                params,
+            ).fetchone()
+            total = int(total_row[0]) if total_row else 0
+
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id, session_id, timestamp, method, scheme, host, port, path,
+                    status_code, duration_ms, response_content_type, request_content_type,
+                    request_body_size, response_body_size
+                FROM http_flows
+                {where_sql}
+                ORDER BY {order_sql}
+                LIMIT ? OFFSET ?;
+                """,
+                [*params, max(1, int(limit)), max(0, int(offset))],
+            ).fetchall()
+
+        flows: list[dict[str, Any]] = []
+        for row in rows:
+            flows.append(
+                {
+                    "id": str(row["id"]),
+                    "session_id": str(row["session_id"]),
+                    "time": _format_iso_time(float(row["timestamp"])),
+                    "method": str(row["method"]),
+                    "url": _format_url(
+                        str(row["scheme"]),
+                        str(row["host"]),
+                        int(row["port"]),
+                        str(row["path"]),
+                    ),
+                    "status_code": int(row["status_code"])
+                    if row["status_code"] is not None
+                    else None,
+                    "duration_ms": float(row["duration_ms"])
+                    if row["duration_ms"] is not None
+                    else None,
+                    "content_type": row["response_content_type"] or row["request_content_type"],
+                    "size": int(row["response_body_size"] or 0),
+                }
+            )
+
+        return {
+            "total": total,
+            "session_id": session_id,
+            "flows": flows,
+        }
+
+    def _resolve_raw_body(
+        self,
+        blob_val: bytes | None,
+        path_val: str | None,
+    ) -> bytes:
+        if blob_val is not None:
+            return bytes(blob_val)
+        if path_val:
+            file_path = Path(path_val)
+            if file_path.is_file():
+                return file_path.read_bytes()
+        return b""
+
+    def _build_body_detail(
+        self,
+        *,
+        flow_id: str,
+        direction: Literal["req", "resp"],
+        size: int,
+        content_type: str | None,
+        is_binary: bool,
+        preview_db: str | None,
+        blob_val: bytes | None,
+        path_val: str | None,
+        max_body_chars: int,
+        dump_body_to_file: bool,
+    ) -> dict[str, Any]:
+        raw_bytes = self._resolve_raw_body(blob_val, path_val)
+        if raw_bytes:
+            preview, truncated = _decode_preview(raw_bytes, is_binary, max(1, max_body_chars))
+        else:
+            text_fallback = preview_db or ""
+            truncated = len(text_fallback) > max_body_chars
+            preview = text_fallback[:max_body_chars]
+
+        file_path = path_val
+        if dump_body_to_file and raw_bytes and not file_path:
+            self.bodies_dir.mkdir(parents=True, exist_ok=True)
+            dumped = (self.bodies_dir / f"{flow_id}_{direction}.bin").resolve()
+            dumped.write_bytes(raw_bytes)
+            file_path = str(dumped)
+
+        return {
+            "size": size,
+            "content_type": content_type,
+            "is_binary": is_binary,
+            "preview": preview,
+            "truncated": truncated,
+            "file_path": file_path,
+        }
+
+    def get_http_flow_detail(
+        self,
+        flow_id: str,
+        *,
+        include_headers: bool = True,
+        include_body: bool = True,
+        max_body_chars: int = DEFAULT_PREVIEW_CHARS,
+        dump_body_to_file: bool = False,
+    ) -> dict[str, Any] | None:
+        """查询单条 HttpFlow 的完整头部、截断解码预览与可选落盘文件路径。
+
+        Args:
+            flow_id: 目标 HttpFlow 的唯一 ID。
+            include_headers: 是否在结果中包含请求与响应头部。
+            include_body: 是否在结果中包含请求与响应 BodyPayload 详情。
+            max_body_chars: 文本预览最大截断字符数，默认 2048。
+            dump_body_to_file: 是否强制将完整原始载荷导出为本地文件并返回路径。
+
+        Returns:
+            流详情字典；当 flow_id 不存在时返回 None。
+        """
+        # 1. 联表查询 http_flows 与 http_bodies
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    f.id, f.session_id, f.timestamp, f.method, f.scheme, f.host, f.port, f.path,
+                    f.status_code, f.duration_ms, f.request_headers, f.response_headers,
+                    f.request_content_type, f.response_content_type,
+                    f.request_body_size, f.response_body_size, f.has_error, f.error_message,
+                    b.request_body_preview, b.response_body_preview,
+                    b.request_body, b.response_body,
+                    b.is_request_binary, b.is_response_binary,
+                    b.request_body_path, b.response_body_path
+                FROM http_flows f
+                LEFT JOIN http_bodies b ON f.id = b.flow_id
+                WHERE f.id = ?;
+                """,
+                (flow_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        # 2. 组装基础流元数据与可选 Headers / BodyPayload 视图
+        result: dict[str, Any] = {
+            "id": str(row["id"]),
+            "session_id": str(row["session_id"]),
+            "time": _format_iso_time(float(row["timestamp"])),
+            "method": str(row["method"]),
+            "scheme": str(row["scheme"]),
+            "host": str(row["host"]),
+            "port": int(row["port"]),
+            "path": str(row["path"]),
+            "url": _format_url(
+                str(row["scheme"]),
+                str(row["host"]),
+                int(row["port"]),
+                str(row["path"]),
+            ),
+            "status_code": int(row["status_code"]) if row["status_code"] is not None else None,
+            "duration_ms": float(row["duration_ms"]) if row["duration_ms"] is not None else None,
+            "has_error": bool(row["has_error"]),
+            "error_message": row["error_message"],
+        }
+
+        if include_headers:
+            result["request_headers"] = json.loads(row["request_headers"] or "{}")
+            result["response_headers"] = json.loads(row["response_headers"] or "{}")
+
+        if include_body:
+            result["request_body"] = self._build_body_detail(
+                flow_id=str(row["id"]),
+                direction="req",
+                size=int(row["request_body_size"] or 0),
+                content_type=row["request_content_type"],
+                is_binary=bool(row["is_request_binary"]),
+                preview_db=row["request_body_preview"],
+                blob_val=row["request_body"],
+                path_val=row["request_body_path"],
+                max_body_chars=max_body_chars,
+                dump_body_to_file=dump_body_to_file,
+            )
+            result["response_body"] = self._build_body_detail(
+                flow_id=str(row["id"]),
+                direction="resp",
+                size=int(row["response_body_size"] or 0),
+                content_type=row["response_content_type"],
+                is_binary=bool(row["is_response_binary"]),
+                preview_db=row["response_body_preview"],
+                blob_val=row["response_body"],
+                path_val=row["response_body_path"],
+                max_body_chars=max_body_chars,
+                dump_body_to_file=dump_body_to_file,
+            )
+
+        return result
 
     def verify_health(self) -> StorageHealth:
         """探测当前 SQLite WAL 数据总线与分流目录的读写状态及表结构完整性。
