@@ -1,0 +1,17 @@
+# ==============================================================================
+# GitHub 代码属主与审阅者自动指派配置 (Code Owners)
+# 详见: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# 机制说明：
+# 1. 当外部贡献者提交 Pull Request 时，GitHub 将自动为匹配路径指派对应的 Reviewer；
+# 2. 语法格式：<路径模式> <所有者 GitHub 账号或团队，以 @ 开头>；
+# 3. 运行 scripts/setup.sh 可自动将 @atengk 替换为你的 GitHub 账号。
+# ==============================================================================
+
+# 全局默认所有者（通配所有未被下级路径覆盖的文件）
+* @atengk
+
+# 核心基础设施与自动化流水线重点守护
+/.github/ @atengk
+/scripts/ @atengk
+/.githooks/ @atengk
