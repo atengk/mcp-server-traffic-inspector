@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server_traffic_inspector.capture_manager import HttpCaptureManager
 from mcp_server_traffic_inspector.config import LOGGER_NAME, ServerConfig
+from mcp_server_traffic_inspector.pcap import PcapCaptureManager
 from mcp_server_traffic_inspector.replay import FlowReplayEngine
 from mcp_server_traffic_inspector.storage import DEFAULT_PREVIEW_CHARS, StorageBus
 
@@ -266,11 +267,85 @@ def _register_manipulation_tools(
         return storage.clear_intercept_rules(rule_id=rule_id)
 
 
+def _register_pcap_tools(
+    mcp: FastMCP,
+    pcap_manager: PcapCaptureManager,
+) -> None:
+    @mcp.tool()
+    def list_network_interfaces() -> list[dict[str, Any]]:
+        """枚举当前主机可用于抓包的网络接口列表。
+
+        Returns:
+            包含 index、name 与 description 的网卡列表；未安装 tshark 或无网卡时返回 []。
+        """
+        return pcap_manager.list_interfaces()
+
+    @mcp.tool()
+    def start_pcap_capture(
+        interface: int | str = 1,
+        output_path: str | None = None,
+        bpf_filter: str | None = None,
+        max_packets: int = 2000,
+        duration_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """在指定网卡上启动原始网络层数据包捕获 (PcapCapture)，受双重熔断阈值保护。
+
+        Args:
+            interface: 网卡索引或名称，默认 1。
+            output_path: 保存目标 .pcap 文件绝对路径；为空时自动生成。
+            bpf_filter: 可选的 Berkeley Packet Filter 表达式（如 'tcp and port 443'）。
+            max_packets: 最大抓包数熔断上限，默认 2000 包。
+            duration_seconds: 最大抓包时长熔断上限，默认 60 秒。
+
+        Returns:
+            包含状态、网卡、产出文件绝对路径与熔断限制的字典。
+        """
+        return pcap_manager.start_capture(
+            interface=interface,
+            output_path=output_path,
+            bpf_filter=bpf_filter,
+            max_packets=max_packets,
+            duration_seconds=duration_seconds,
+        )
+
+    @mcp.tool()
+    def stop_pcap_capture() -> dict[str, Any]:
+        """停止当前正在运行的实时 PCAP 网卡抓包任务并返回数据包统计。
+
+        Returns:
+            包含 status ("stopped")、pcap_file 与 packet_count 的字典。
+        """
+        return pcap_manager.stop_capture()
+
+    @mcp.tool()
+    def analyze_pcap_file(
+        file_path: str,
+        display_filter: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """调用 tshark 对离线 .pcap/.pcapng 报文执行协议分布、TCP 重传率与 DNS 深度分析。
+
+        Args:
+            file_path: 本地 .pcap / .pcapng 文件路径。
+            display_filter: 可选的 Wireshark Display Filter 过滤表达式。
+            limit: 分析的最大报文上限数，默认 50。
+
+        Returns:
+            包含总报文数、协议占比、TCP 质量指标与 DNS 统计的诊断字典。
+        """
+        return pcap_manager.analyze_pcap(
+            file_path=file_path,
+            display_filter=display_filter,
+            limit=limit,
+        )
+
+
 def create_mcp_server(
     config: ServerConfig,
     storage: StorageBus | None = None,
     capture_manager: HttpCaptureManager | None = None,
     replay_engine: FlowReplayEngine | None = None,
+    pcap_manager: PcapCaptureManager | None = None,
     lifecycle: LifecycleManager | None = None,
 ) -> FastMCP:
     """构建并初始化 FastMCP 服务实例、共享 SQLite WAL 数据总线与 MCP 工具集。
@@ -280,6 +355,7 @@ def create_mcp_server(
         storage: 可选的外部 StorageBus 实例；未传入时根据 config 自动构建并初始化。
         capture_manager: 可选的外部 HttpCaptureManager 实例。
         replay_engine: 可选的外部 FlowReplayEngine 实例。
+        pcap_manager: 可选的外部 PcapCaptureManager 实例。
         lifecycle: 可选的生命周期管理器；传入时自动注册子进程停止钩子。
 
     Returns:
@@ -290,8 +366,11 @@ def create_mcp_server(
     bus.initialize()
     manager = capture_manager or HttpCaptureManager(storage=bus)
     replayer = replay_engine or FlowReplayEngine(storage=bus)
+    pcap_mgr = pcap_manager or PcapCaptureManager(tshark_path=config.tshark_path)
+
     if lifecycle is not None:
         lifecycle.register(lambda: None if manager.stop_capture() else None)
+        lifecycle.register(lambda: None if pcap_mgr.stop_capture() else None)
 
     # 2. 创建 FastMCP 主控实例并注册各领域工具集
     mcp = FastMCP(
@@ -303,4 +382,5 @@ def create_mcp_server(
     )
     _register_http_tools(mcp=mcp, storage=bus, manager=manager)
     _register_manipulation_tools(mcp=mcp, storage=bus, replay_engine=replayer)
+    _register_pcap_tools(mcp=mcp, pcap_manager=pcap_mgr)
     return mcp
