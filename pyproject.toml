@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atengk-mcp-server-traffic-inspector"
-version = "1.1.1"
+version = "1.2.0"
 description = "专为 AI Agent 打造的网络流量抓包、会话检索、链路质量诊断、请求重放与规则 Mock 的全功能 MCP Server"
 readme = "README.md"
 license = { file = "LICENSE" }
