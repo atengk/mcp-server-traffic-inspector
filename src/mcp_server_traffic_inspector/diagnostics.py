@@ -12,6 +12,7 @@ from typing import Any
 
 from mcp_server_traffic_inspector.config import LOGGER_NAME
 from mcp_server_traffic_inspector.pcap import PcapCaptureManager
+from mcp_server_traffic_inspector.pcap_slicer import CaptureSidecar
 from mcp_server_traffic_inspector.storage import StorageBus, _format_url
 
 logger = logging.getLogger(LOGGER_NAME)
@@ -397,18 +398,43 @@ class NetworkDiagnostics:
                 }
             )
 
-        score = max(0, min(100, score))
-        if score >= 80:
-            health_status = "healthy"
-            summary = "网络层链路质量良好，未见显著重传、延迟或 DNS 异常。"
-        elif score >= 50:
-            health_status = "degraded"
-            summary = "网络层链路出现轻度拥塞或延迟偏高，建议优化网络配置。"
-        else:
-            health_status = "critical"
-            summary = "网络层链路质量严重劣化（重传或解析失败），需重点排查底层网络。"
+        # 4. 伴随元数据 (Sidecar) 挂载与双轨代理重定向感知
+        sidecar = CaptureSidecar.load(file_path)
+        redirection_notice: dict[str, Any] | None = None
+        if sidecar:
+            extra = sidecar.get("extra") or {}
+            redirection_notice = extra.get("redirection_notice")
 
-        return {
+        total_pkts = int(analysis.get("total_packets") or 0)
+        if total_pkts == 0:
+            if redirection_notice:
+                score = 100
+                health_status = "healthy"
+                summary = (
+                    "检测到目标进程流量已被本地 HTTP 代理接管（代理分流正常）。"
+                    "物理网卡切片无直接外联报文，全量明文数据已录制在 HTTP 会话中。"
+                )
+                recommendations.append(
+                    "若需捕获四层底层裸 TCP 二进制报文，请关闭全局代理后再启动抓包。"
+                )
+            else:
+                score = 50
+                health_status = "degraded"
+                summary = "PCAP 文件报文总数为 0，未捕获到任何有效网络数据包。"
+                recommendations.append("检查抓包网卡选择、BPF 过滤表达式或目标进程网络活动。")
+        else:
+            score = max(0, min(100, score))
+            if score >= 80:
+                health_status = "healthy"
+                summary = "网络层链路质量良好，未见显著重传、延迟或 DNS 异常。"
+            elif score >= 50:
+                health_status = "degraded"
+                summary = "网络层链路出现轻度拥塞或延迟偏高，建议优化网络配置。"
+            else:
+                health_status = "critical"
+                summary = "网络层链路质量严重劣化（重传或解析失败），需重点排查底层网络。"
+
+        report: dict[str, Any] = {
             "session_type": "pcap",
             "target": file_path,
             "health_status": health_status,
@@ -417,6 +443,14 @@ class NetworkDiagnostics:
             "anomalies": anomalies,
             "recommendations": recommendations,
         }
+        if sidecar:
+            report["sidecar_loaded"] = True
+            report["process_family"] = sidecar.get("process_family")
+            report["server_topology"] = sidecar.get("server_topology")
+            if redirection_notice:
+                report["redirection_notice"] = redirection_notice
+
+        return report
 
     def diagnose_network_session(
         self,

@@ -186,10 +186,66 @@ def test_har_exporter_invalid_format_and_empty_session(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="未找到可导出的 HTTP 会话数据"):
         exporter.export_session(output_path=tmp_path / "empty.har")
 
+    # 指定了 session_id 但无流量时应生成合法空 HAR 归档
+    empty_har_out = tmp_path / "valid_empty.har"
+    empty_res = exporter.export_session(
+        output_path=empty_har_out,
+        session_id="empty-sess-1",
+    )
+    assert empty_res["flow_count"] == 0
+    empty_har_data = json.loads(empty_har_out.read_text(encoding="utf-8"))
+    assert empty_har_data["log"]["entries"] == []
+
+
+def test_system_proxy_get_status_and_smart_restore_ownership() -> None:
+    """SystemProxyManager 应正确探查代理状态，且 smart_restore 仅在归属匹配时复位。"""
+    mgr = SystemProxyManager()
+    mgr._is_windows = True
+
+    mock_reg = {
+        "ProxyEnable": 1,
+        "ProxyServer": "127.0.0.1:7890",  # 第三方 Clash 代理
+    }
+
+    def fake_read() -> tuple[int, str]:
+        return (mock_reg["ProxyEnable"], mock_reg["ProxyServer"])
+
+    def fake_write(enabled: int, server: str) -> None:
+        mock_reg["ProxyEnable"] = enabled
+        mock_reg["ProxyServer"] = server
+
+    with (
+        patch.object(mgr, "_read_registry", side_effect=fake_read),
+        patch.object(mgr, "_write_registry", side_effect=fake_write),
+        patch.object(mgr, "_refresh_system_settings"),
+    ):
+        # 1. 探查当前指向第三方的代理状态
+        status = mgr.get_proxy_status(expected_port=8080)
+        assert status["system_proxy_enabled"] is True
+        assert status["proxy_server"] == "127.0.0.1:7890"
+        assert status["is_pointing_to_inspector"] is False
+
+        # 2. 尝试智能复位 -> 检测到第三方所有权，跳过复位保护网络
+        restore_res = mgr.smart_restore(expected_port=8080)
+        assert restore_res["restored"] is False
+        assert restore_res["reason"] == "external_proxy_owned"
+        assert mock_reg["ProxyEnable"] == 1  # 保持开启
+
+        # 3. 将代理修改为指向本抓包端口 127.0.0.1:8080
+        mock_reg["ProxyServer"] = "127.0.0.1:8080"
+        status_own = mgr.get_proxy_status(expected_port=8080)
+        assert status_own["is_pointing_to_inspector"] is True
+
+        # 4. 执行智能复位 -> 匹配成功，安全关闭代理
+        restore_success = mgr.smart_restore(expected_port=8080)
+        assert restore_success["restored"] is True
+        assert restore_success["system_proxy_enabled"] is False
+        assert mock_reg["ProxyEnable"] == 0
+
 
 @pytest.mark.asyncio
 async def test_ops_mcp_tools_registration(tmp_path: Path) -> None:
-    """验证全部 18 个 MCP 工具均已注册且运维工具正常响应。"""
+    """验证全部 19 个 MCP 工具均已注册且运维工具正常响应。"""
     config = parse_config([])
     bus = StorageBus(
         db_path=tmp_path / "server_test.db",
@@ -202,12 +258,20 @@ async def test_ops_mcp_tools_registration(tmp_path: Path) -> None:
     tools = await server.list_tools()
     tool_names = [t.name for t in tools]
 
-    assert len(tool_names) == 18
+    assert len(tool_names) == 19
     assert "get_ca_certificate" in tool_names
     assert "toggle_system_proxy" in tool_names
+    assert "get_system_proxy_status" in tool_names
     assert "export_http_session" in tool_names
 
     # 调用 get_ca_certificate
     ca_res = await server.call_tool("get_ca_certificate", {})
     ca_data = ca_res[0].text if hasattr(ca_res[0], "text") else str(ca_res)
     assert "instructions" in ca_data
+
+    # 调用 get_system_proxy_status
+    status_res = await server.call_tool("get_system_proxy_status", {})
+    status_dict = (
+        status_res[1] if isinstance(status_res, tuple) and len(status_res) > 1 else status_res
+    )
+    assert "supported" in str(status_dict)

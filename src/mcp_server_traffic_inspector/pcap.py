@@ -465,11 +465,6 @@ class PcapCaptureManager:
                 except Exception as exc:
                     logger.warning("执行 PCAP 时空切片异常: %s", exc)
 
-            CaptureSidecar.save(
-                pcap_path=final_target,
-                process_family=family,
-                timeline=timeline,
-            )
             pcap_file = str(final_target)
         else:
             pcap_file = raw_capture_file
@@ -486,6 +481,49 @@ class PcapCaptureManager:
             except Exception as exc:
                 logger.debug("统计 PCAP 文件包数失败: %s", exc)
 
+        # 4. 双轨抓包模式感知：检测流量是否完全被系统代理重定向至本地回环接口
+        redirection_notice: dict[str, Any] | None = None
+        if is_process_mode and packet_count == 0 and server_topology:
+            loopback_hits = sum(
+                item["hit_count"]
+                for item in server_topology
+                if item.get("server_ip") in ("127.0.0.1", "::1", "localhost")
+            )
+            external_hits = sum(
+                item["hit_count"]
+                for item in server_topology
+                if item.get("server_ip") not in ("127.0.0.1", "::1", "localhost")
+            )
+            if loopback_hits > 0 and external_hits == 0:
+                proxy_ports = sorted(
+                    {
+                        item["port"]
+                        for item in server_topology
+                        if item.get("server_ip") in ("127.0.0.1", "::1", "localhost")
+                    }
+                )
+                redirection_notice = {
+                    "is_redirected_to_proxy": True,
+                    "proxy_ports": proxy_ports,
+                    "loopback_hits": loopback_hits,
+                    "message": (
+                        f"检测到目标进程活跃连接已被本地代理端口 ({proxy_ports}) 接管，"
+                        "未流经物理网卡。全量明文数据已完整保存在 HTTP 抓包会话与 HAR 归档中。"
+                    ),
+                }
+
+        # 5. 持久化伴随元数据 (CaptureSidecar)
+        if is_process_mode and tracker is not None and final_target is not None:
+            extra_meta: dict[str, Any] = {}
+            if redirection_notice is not None:
+                extra_meta["redirection_notice"] = redirection_notice
+            CaptureSidecar.save(
+                pcap_path=final_target,
+                process_family=family,
+                timeline=timeline,
+                extra=extra_meta,
+            )
+
         res: dict[str, Any] = {
             "status": "stopped",
             "pcap_file": pcap_file,
@@ -494,6 +532,8 @@ class PcapCaptureManager:
         if is_process_mode:
             res["process_summary"] = process_summary
             res["server_topology"] = server_topology
+            if redirection_notice is not None:
+                res["redirection_notice"] = redirection_notice
 
         return res
 

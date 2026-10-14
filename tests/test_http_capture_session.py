@@ -10,12 +10,16 @@ import gzip
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+
+import pytest
 
 from mcp_server_traffic_inspector.capture_manager import HttpCaptureManager
 from mcp_server_traffic_inspector.config import parse_config
 from mcp_server_traffic_inspector.proxy_addon import TrafficCaptureAddon
 from mcp_server_traffic_inspector.server import create_mcp_server
 from mcp_server_traffic_inspector.storage import StorageBus
+from mcp_server_traffic_inspector.system_proxy import SystemProxyManager
 
 
 @dataclass
@@ -285,3 +289,79 @@ async def test_mcp_server_exposes_five_http_capture_and_query_tools(
     _, stop_data = await mcp.call_tool("stop_http_capture", {})
     assert stop_data["status"] == "stopped"
     assert stop_data["total_captured_flows"] == 1
+
+
+@pytest.mark.asyncio
+async def test_start_and_stop_http_capture_bundled_workflow(tmp_path: Path) -> None:
+    """start_http_capture 联动代理设置，stop_http_capture 聚合 HAR 导出与代理复位。"""
+    db_file = tmp_path / "bundled.db"
+    cfg = parse_config(argv=["--db-path", str(db_file)], env={})
+    bus = StorageBus.from_config(cfg)
+    manager = HttpCaptureManager(
+        storage=bus,
+        process_spawner=lambda cmd, env: FakeWorkerProcess(cmd=cmd, env=env),
+    )
+    sys_proxy = SystemProxyManager()
+    sys_proxy._is_windows = True
+
+    mock_reg = {"ProxyEnable": 0, "ProxyServer": ""}
+
+    def fake_read():
+        return (mock_reg["ProxyEnable"], mock_reg["ProxyServer"])
+
+    def fake_write(enabled, server):
+        mock_reg["ProxyEnable"] = enabled
+        mock_reg["ProxyServer"] = server
+
+    with (
+        patch.object(sys_proxy, "_read_registry", side_effect=fake_read),
+        patch.object(sys_proxy, "_write_registry", side_effect=fake_write),
+        patch.object(sys_proxy, "_refresh_system_settings"),
+    ):
+        mcp = create_mcp_server(
+            config=cfg,
+            storage=bus,
+            capture_manager=manager,
+            system_proxy=sys_proxy,
+        )
+
+        # 1. 启动抓包并自动托管系统代理
+        _, start_res = await mcp.call_tool(
+            "start_http_capture",
+            {"port": 8080, "auto_set_system_proxy": True},
+        )
+        assert start_res["status"] == "running"
+        assert "system_proxy" in start_res
+        assert start_res["system_proxy"]["system_proxy_enabled"] is True
+        assert mock_reg["ProxyEnable"] == 1
+        assert mock_reg["ProxyServer"] == "127.0.0.1:8080"
+
+        # 2. 模拟写入一条流量
+        bus.record_http_flow(
+            flow_id="f-bundled-1",
+            session_id=start_res["session_id"],
+            timestamp=1700000000.0,
+            method="GET",
+            scheme="http",
+            host="example.com",
+            port=80,
+            path="/index",
+            status_code=200,
+        )
+
+        # 3. 一步停止抓包、导出 HAR 并复位系统代理
+        target_har = tmp_path / "exported.har"
+        _, stop_res = await mcp.call_tool(
+            "stop_http_capture",
+            {
+                "auto_export_har": True,
+                "har_output_path": str(target_har),
+                "restore_system_proxy": True,
+            },
+        )
+        assert stop_res["status"] == "stopped"
+        assert stop_res["total_captured_flows"] == 1
+        assert stop_res["har_export"]["exported"] is True
+        assert Path(stop_res["har_export"]["file_path"]).is_file()
+        assert stop_res["system_proxy"]["restored"] is True
+        assert mock_reg["ProxyEnable"] == 0

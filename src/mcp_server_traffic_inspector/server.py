@@ -7,7 +7,10 @@
 from __future__ import annotations
 
 import logging
+import tempfile
+import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -70,6 +73,8 @@ def _register_http_tools(
     mcp: FastMCP,
     storage: StorageBus,
     manager: HttpCaptureManager,
+    system_proxy: SystemProxyManager,
+    har_exporter: HarExporter,
 ) -> None:
     @mcp.tool()
     def start_http_capture(
@@ -77,6 +82,7 @@ def _register_http_tools(
         listen_host: str = "0.0.0.0",
         filter_host: str | None = None,
         ssl_insecure: bool = True,
+        auto_set_system_proxy: bool = False,
     ) -> dict[str, Any]:
         """启动受控 mitmdump 后台代理会话 (CaptureSession) 捕获 HTTP/HTTPS 流量。
 
@@ -85,25 +91,81 @@ def _register_http_tools(
             listen_host: 代理监听地址，默认 "0.0.0.0"。
             filter_host: 可选的目标采集域名（非目标域名正常转发，仅目标域名写入数据库）。
             ssl_insecure: 是否忽略上游服务端 TLS 证书错误，默认 True。
+            auto_set_system_proxy: 是否启动后自动将系统代理设为当前端口，默认 False。
 
         Returns:
-            包含运行状态、监听地址端口、session_id、数据库路径与 CA 证书路径的字典。
+            包含状态、端口、session_id、db_path、ca_cert_path 及系统代理信息的字典。
         """
-        return manager.start_capture(
+        res = manager.start_capture(
             port=port,
             listen_host=listen_host,
             filter_host=filter_host,
             ssl_insecure=ssl_insecure,
         )
+        if auto_set_system_proxy:
+            proxy_res = system_proxy.toggle_proxy(enable=True, host="127.0.0.1", port=port)
+            res["system_proxy"] = proxy_res
+        return res
 
     @mcp.tool()
-    def stop_http_capture() -> dict[str, Any]:
-        """停止当前正在运行的 HTTP/HTTPS 抓包代理会话并返回捕获统计。
+    def stop_http_capture(
+        auto_export_har: bool = True,
+        har_output_path: str | None = None,
+        restore_system_proxy: bool = True,
+    ) -> dict[str, Any]:
+        """停止 HTTP 抓包代理，支持自动导出 HAR 归档并按所有权安全复位系统代理。
+
+        Args:
+            auto_export_har: 是否自动将当前会话全量数据导出为 HAR 1.2 归档文件，默认 True。
+            har_output_path: 导出的目标 HAR 文件路径；为空时自动在系统临时目录生成。
+            restore_system_proxy: 是否在停止抓包后安全复位操作系统代理状态，默认 True。
 
         Returns:
-            包含 status ("stopped")、session_id 与 total_captured_flows 的字典。
+            包含 status、session_id、total_captured_flows、har_export 及 system_proxy 的字典。
         """
-        return manager.stop_capture()
+        running_port = manager._port or 8080
+        running_host = manager._listen_host or "127.0.0.1"
+
+        res = manager.stop_capture()
+        session_id = res.get("session_id")
+
+        # 1. 自动导出 HAR 1.2 归档文件
+        if auto_export_har and session_id:
+            try:
+                if not har_output_path or not har_output_path.strip():
+                    temp_dir = Path(tempfile.gettempdir()) / "har_captures"
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+                    resolved_output = temp_dir / f"traffic_{session_id}_{int(time.time())}.har"
+                else:
+                    resolved_output = Path(har_output_path).resolve()
+
+                export_res = har_exporter.export_session(
+                    output_path=resolved_output,
+                    session_id=session_id,
+                    format="har",
+                )
+                res["har_export"] = {
+                    "exported": True,
+                    "file_path": export_res["exported_path"],
+                    "flow_count": export_res["flow_count"],
+                    "file_size_bytes": export_res["file_size_bytes"],
+                }
+            except Exception as exc:
+                logger.warning("停止抓包时自动导出 HAR 发生异常: %s", exc)
+                res["har_export"] = {
+                    "exported": False,
+                    "error": str(exc),
+                }
+
+        # 2. 智能安全复位系统代理 (Proxy Ownership Check)
+        if restore_system_proxy:
+            proxy_res = system_proxy.smart_restore(
+                expected_host=running_host,
+                expected_port=running_port,
+            )
+            res["system_proxy"] = proxy_res
+
+        return res
 
     @mcp.tool()
     def get_capture_status() -> dict[str, Any]:
@@ -436,6 +498,22 @@ def _register_ops_tools(
         return system_proxy.toggle_proxy(enable=enable, host=host, port=port)
 
     @mcp.tool()
+    def get_system_proxy_status(
+        port: int = 8080,
+        host: str = "127.0.0.1",
+    ) -> dict[str, Any]:
+        """主动探查宿主机当前操作系统全局代理配置、状态及其与本服务端口的绑定关系。
+
+        Args:
+            port: 待比对的目标代理端口，默认 8080。
+            host: 待比对的目标代理主机地址，默认 127.0.0.1。
+
+        Returns:
+            包含 supported、system_proxy_enabled、proxy_server、is_pointing 的字典。
+        """
+        return system_proxy.get_proxy_status(expected_host=host, expected_port=port)
+
+    @mcp.tool()
     def export_http_session(
         output_path: str,
         session_id: str | None = None,
@@ -483,7 +561,7 @@ def create_mcp_server(
         lifecycle: 可选的生命周期管理器；传入时自动注册子进程与代理状态停止钩子。
 
     Returns:
-        完成全部 18 个工具注册的 FastMCP 服务对象。
+        完成全部 19 个工具注册的 FastMCP 服务对象。
     """
     # 1. 初始化共享 SQLite WAL 数据总线与核心业务管理器
     bus = storage or StorageBus.from_config(config)
@@ -500,7 +578,7 @@ def create_mcp_server(
         lifecycle.register(lambda: None if pcap_mgr.stop_capture() else None)
         lifecycle.register(lambda: sys_proxy.restore_initial_state())
 
-    # 2. 创建 FastMCP 主控实例并注册各领域工具集 (18 个 Tools)
+    # 2. 创建 FastMCP 主控实例并注册各领域工具集 (19 个 Tools)
     mcp = FastMCP(
         name=SERVER_NAME,
         instructions=SERVER_INSTRUCTIONS,
@@ -508,7 +586,13 @@ def create_mcp_server(
         port=config.port,
         log_level=config.log_level,
     )
-    _register_http_tools(mcp=mcp, storage=bus, manager=manager)
+    _register_http_tools(
+        mcp=mcp,
+        storage=bus,
+        manager=manager,
+        system_proxy=sys_proxy,
+        har_exporter=har_exp,
+    )
     _register_manipulation_tools(mcp=mcp, storage=bus, replay_engine=replayer)
     _register_pcap_tools(mcp=mcp, pcap_manager=pcap_mgr)
     _register_diagnostic_tools(mcp=mcp, diagnostics=diag_engine)

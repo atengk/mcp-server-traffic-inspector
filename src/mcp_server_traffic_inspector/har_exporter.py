@@ -87,14 +87,12 @@ class HarExporter:
                 [resolved_session_id],
             ).fetchall()
 
-        if not rows:
-            raise ValueError(f"会话 '{resolved_session_id}' 下未找到任何已捕获的 HttpFlow。")
-
-        # 2. 组装 HAR 1.2 entries 列表
+        # 2. 组装 HAR 1.2 entries 列表（会话无流量时导出合法空 entries 归档，确保契约始终合法）
         entries: list[dict[str, Any]] = []
-        for r in rows:
-            entry = self._build_har_entry(r)
-            entries.append(entry)
+        if rows:
+            for r in rows:
+                entry = self._build_har_entry(r)
+                entries.append(entry)
 
         har_content = {
             "log": {

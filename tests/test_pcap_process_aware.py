@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from mcp_server_traffic_inspector.config import parse_config
+from mcp_server_traffic_inspector.diagnostics import NetworkDiagnostics
 from mcp_server_traffic_inspector.pcap import PcapCaptureManager
 from mcp_server_traffic_inspector.process_tracker import ProcessInfo, SocketEntry
 from mcp_server_traffic_inspector.server import LifecycleManager, create_mcp_server
@@ -188,3 +189,83 @@ async def test_mcp_tools_support_process_aware_arguments(tmp_path: Path) -> None
     # 停止抓包
     _, stop_res = await mcp_app.call_tool("stop_pcap_capture", {})
     assert stop_res["status"] == "stopped"
+
+
+def test_process_aware_capture_detects_proxy_redirection_and_diagnoses_health(
+    tmp_path: Path,
+) -> None:
+    """双轨抓包且物理网卡切片包为 0 时，应智能识别代理回环分流并在诊断中评定为健康。"""
+    fake_tshark = tmp_path / "tshark.exe"
+    fake_tshark.write_bytes(b"bin")
+
+    def spawner(cmd: list[str], env: dict[str, str]) -> MockWorkerProcess:
+        return MockWorkerProcess(cmd, env)
+
+    def runner(cmd: list[str]) -> str:
+        if "-w" in cmd:
+            target_idx = cmd.index("-w") + 1
+            Path(cmd[target_idx]).write_bytes(b"EMPTY_SLICE_PCAP")
+        if "frame.number" in cmd:
+            return ""
+        if "-r" in cmd and "fields" in cmd:
+            return ""
+        return ""
+
+    def mock_snapshots() -> list[ProcessInfo]:
+        return [
+            ProcessInfo(
+                pid=2000,
+                ppid=1,
+                name="ClientApp.exe",
+                exe_path="C:\\App\\ClientApp.exe",
+            ),
+        ]
+
+    # 模拟目标进程所有外联均指向本地代理回环 127.0.0.1:8080
+    def mock_sockets() -> list[SocketEntry]:
+        return [
+            SocketEntry(
+                proto="TCP",
+                local_ip="127.0.0.1",
+                local_port=54321,
+                remote_ip="127.0.0.1",
+                remote_port=8080,
+                pid=2000,
+            ),
+        ]
+
+    manager = PcapCaptureManager(
+        tshark_path=str(fake_tshark),
+        command_runner=runner,
+        process_spawner=spawner,
+        default_output_dir=tmp_path,
+        snapshot_fetcher=mock_snapshots,
+        socket_fetcher=mock_sockets,
+    )
+
+    start_res = manager.start_capture(
+        process_name="ClientApp.exe",
+        output_path=str(tmp_path / "target_redirected.pcap"),
+    )
+    raw_pcap_file = Path(start_res["output_file"])
+    raw_pcap_file.write_bytes(b"RAW_PCAP_BYTES")
+
+    stop_res = manager.stop_capture()
+
+    assert stop_res["status"] == "stopped"
+    assert stop_res["packet_count"] == 0
+    assert "redirection_notice" in stop_res
+    notice = stop_res["redirection_notice"]
+    assert notice["is_redirected_to_proxy"] is True
+    assert 8080 in notice["proxy_ports"]
+
+    # 验证诊断引擎对该会话的评分与自解释
+    bus = StorageBus(tmp_path / "d.db", tmp_path / "b", preserve_db=False)
+    bus.initialize()
+    diag = NetworkDiagnostics(storage=bus, pcap_manager=manager)
+    diag_res = diag.diagnose_pcap_session(file_path=stop_res["pcap_file"])
+    assert diag_res["health_status"] == "healthy"
+    assert diag_res["health_score"] == 100
+    assert diag_res["sidecar_loaded"] is True
+    assert "代理分流正常" in diag_res["summary"]
+    assert "redirection_notice" in diag_res

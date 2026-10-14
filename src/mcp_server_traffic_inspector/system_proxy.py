@@ -174,6 +174,141 @@ class SystemProxyManager:
         except Exception as exc:
             logger.warning("还原 Windows 系统代理初始状态时发生非致命异常: %s", exc)
 
+    def get_proxy_status(
+        self,
+        expected_host: str = "127.0.0.1",
+        expected_port: int = 8080,
+    ) -> dict[str, Any]:
+        """查询当前系统全局代理状态及是否指向指定的目标抓包服务。
+
+        Args:
+            expected_host: 预期的抓包代理监听地址，默认 127.0.0.1。
+            expected_port: 预期的抓包代理监听端口，默认 8080。
+
+        Returns:
+            包含 supported、enabled、proxy_server、is_pointing_to_inspector 等字段的字典。
+        """
+        if not self._is_windows:
+            return {
+                "supported": False,
+                "system_proxy_enabled": False,
+                "proxy_server": "",
+                "is_pointing_to_inspector": False,
+                "modified_by_current_session": False,
+                "message": "当前操作系统环境不支持通过注册表管理系统代理。",
+            }
+
+        enabled, server = self._read_registry()
+        is_enabled = bool(enabled)
+        server_str = server.strip()
+        expected = f"{expected_host}:{expected_port}"
+        alt_expected = (
+            f"127.0.0.1:{expected_port}" if expected_host in ("0.0.0.0", "localhost") else expected
+        )
+        is_pointing = is_enabled and (
+            server_str == expected
+            or server_str == alt_expected
+            or server_str.endswith(f":{expected_port}")
+        )
+        status_word = "开启" if is_enabled else "关闭"
+        return {
+            "supported": True,
+            "system_proxy_enabled": is_enabled,
+            "proxy_server": server_str if is_enabled else "",
+            "is_pointing_to_inspector": is_pointing,
+            "modified_by_current_session": self._modified_by_us,
+            "message": f"系统代理处于{status_word}状态 ({server_str or '未设置'})。",
+        }
+
+    def smart_restore(
+        self,
+        expected_host: str = "127.0.0.1",
+        expected_port: int = 8080,
+    ) -> dict[str, Any]:
+        """按归属权安全复位系统全局代理 (Proxy Ownership Check)。
+
+        仅当系统代理指向当前抓包代理或由当前会话主动开启时才执行关闭；
+        若检测到当前系统代理指向第三方端口，则跳过关闭以保护用户网络。
+
+        Args:
+            expected_host: 预期的抓包代理监听地址，默认 127.0.0.1。
+            expected_port: 预期的抓包代理监听端口，默认 8080。
+
+        Returns:
+            包含 supported、restored、system_proxy_enabled 与说明信息的字典。
+        """
+        if not self._is_windows:
+            return {
+                "supported": False,
+                "restored": False,
+                "system_proxy_enabled": False,
+                "proxy_server": "",
+                "reason": "unsupported_platform",
+                "message": "当前平台不支持注册表系统代理托管。",
+            }
+
+        enabled, server = self._read_registry()
+        if not enabled:
+            return {
+                "supported": True,
+                "restored": True,
+                "system_proxy_enabled": False,
+                "proxy_server": server.strip(),
+                "message": "系统代理当前已处于关闭状态，无需复位。",
+            }
+
+        server_str = server.strip()
+        expected = f"{expected_host}:{expected_port}"
+        alt_expected = (
+            f"127.0.0.1:{expected_port}" if expected_host in ("0.0.0.0", "localhost") else expected
+        )
+        is_pointing = (
+            server_str == expected
+            or server_str == alt_expected
+            or server_str.endswith(f":{expected_port}")
+        )
+
+        if self._modified_by_us or is_pointing:
+            try:
+                target_server = (
+                    self._initial_server if (self._initial_enabled and self._initial_server) else ""
+                )
+                self._write_registry(enabled=0, server=target_server)
+                self._refresh_system_settings()
+                self._modified_by_us = False
+                logger.info("已安全复位并关闭当前抓包实例托管的系统代理")
+                return {
+                    "supported": True,
+                    "restored": True,
+                    "system_proxy_enabled": False,
+                    "proxy_server": "",
+                    "message": "已成功复位并关闭当前抓包实例托管的系统代理。",
+                }
+            except Exception as exc:
+                logger.error("复位系统代理失败: %s", exc)
+                return {
+                    "supported": True,
+                    "restored": False,
+                    "system_proxy_enabled": True,
+                    "proxy_server": server_str,
+                    "message": f"复位系统代理时发生异常: {exc}",
+                }
+
+        # 系统代理指向外部第三方
+        logger.info(
+            "当前系统代理指向外部服务 (%s)，非本抓包服务 (%s)，已跳过复位",
+            server_str,
+            expected,
+        )
+        return {
+            "supported": True,
+            "restored": False,
+            "system_proxy_enabled": True,
+            "proxy_server": server_str,
+            "reason": "external_proxy_owned",
+            "message": f"当前系统代理指向外部服务 ({server_str})，已跳过复位以保护第三方代理配置。",
+        }
+
     def _read_registry(self) -> tuple[int, str]:
         """读取 Windows 注册表中当前 Internet Settings 代理配置。"""
         import winreg
