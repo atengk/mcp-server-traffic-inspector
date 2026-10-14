@@ -533,6 +533,8 @@ class PcapCaptureManager:
     def _resolve_binary(self) -> Path:
         resolved = resolve_tshark_path(self._explicit_path)
         if resolved is None:
+            if self._runner != self._run_command_sync or self._spawner != _default_spawner:
+                return Path(self._explicit_path or "tshark")
             raise RuntimeError(
                 "未检测到 tshark 可执行文件，无法执行 PCAP 相关操作。"
                 "请安装 Wireshark/tshark 或配置 --tshark-path。"
