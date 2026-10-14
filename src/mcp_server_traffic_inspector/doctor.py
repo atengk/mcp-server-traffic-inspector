@@ -194,13 +194,15 @@ def _probe_binary_version(binary_path: Path) -> str | None:
             [str(binary_path), "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5.0,
             check=False,
         )
         output = (completed.stdout or completed.stderr or "").strip()
         if output:
             return output.splitlines()[0].strip()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
     return None
 

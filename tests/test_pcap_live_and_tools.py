@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from mcp_server_traffic_inspector.config import parse_config
@@ -141,3 +142,25 @@ async def test_mcp_server_exposes_and_calls_four_pcap_tools(tmp_path: Path) -> N
     )
     assert analysis["total_packets"] == 1
     assert analysis["protocol_distribution"].get("TCP") == 1
+
+
+def test_run_command_sync_handles_utf8_output_and_decoding_errors_gracefully(
+    monkeypatch,
+) -> None:
+    """_run_command_sync 应在 Windows 下使用 utf-8/replace 解码并防御 UnicodeDecodeError。"""
+    manager = PcapCaptureManager()
+
+    # 1. 模拟正常 UTF-8 中文输出（如中文网卡名）
+    class FakeCompleted:
+        stdout = "1. \\Device\\NPF_{GUID} (本地连接* 9)\n"
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: FakeCompleted())
+    res = manager._run_command_sync(["dummy", "-D"])
+    assert "本地连接* 9" in res
+
+    # 2. 模拟抛出 UnicodeDecodeError 异常时应被捕获并安全返回空字符串
+    def mock_raising_decode_error(*args, **kwargs):
+        raise UnicodeDecodeError("gbk", b"\xac", 57, 58, "illegal multibyte sequence")
+
+    monkeypatch.setattr(subprocess, "run", mock_raising_decode_error)
+    assert manager._run_command_sync(["dummy", "-D"]) == ""

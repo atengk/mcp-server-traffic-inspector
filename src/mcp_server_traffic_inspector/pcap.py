@@ -261,11 +261,13 @@ class PcapCaptureManager:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30.0,
                 check=False,
             )
             return completed.stdout or ""
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
             logger.warning("执行 tshark 命令失败 (%s): %s", cmd, exc)
             return ""
 

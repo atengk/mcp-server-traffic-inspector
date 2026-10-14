@@ -6,10 +6,15 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from mcp_server_traffic_inspector.config import parse_config
-from mcp_server_traffic_inspector.doctor import resolve_tshark_path, run_doctor
+from mcp_server_traffic_inspector.doctor import (
+    _probe_binary_version,
+    resolve_tshark_path,
+    run_doctor,
+)
 
 
 def test_resolve_tshark_path_prioritizes_explicit_then_path_then_windows_defaults(
@@ -83,3 +88,30 @@ def test_run_doctor_fails_when_explicit_tshark_path_missing(tmp_path: Path) -> N
     assert report.ready is False
     assert report.exit_code == 1
     assert report.checks["tshark"].status == "error"
+
+
+def test_probe_binary_version_handles_utf8_and_unicode_decode_error(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """_probe_binary_version 应能正常提取 UTF-8 版本信息并在解码错误时返回 None。"""
+    dummy_bin = tmp_path / "probe.exe"
+    dummy_bin.write_bytes(b"bin")
+
+    # 1. 模拟含 UTF-8 非 ASCII 字符的版本输出
+    class FakeCompleted:
+        stdout = "TShark (Wireshark) 4.2.0 (v4.2.0-0-g12345 本地构建版)\n"
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: FakeCompleted())
+    version = _probe_binary_version(dummy_bin)
+    assert version is not None
+    assert "4.2.0" in version
+    assert "本地构建版" in version
+
+    # 2. 模拟抛出 UnicodeDecodeError 异常时应被捕获并返回 None
+    def mock_raising_decode_error(*args, **kwargs):
+        raise UnicodeDecodeError("gbk", b"\xac", 57, 58, "illegal multibyte sequence")
+
+    monkeypatch.setattr(subprocess, "run", mock_raising_decode_error)
+    assert _probe_binary_version(dummy_bin) is None

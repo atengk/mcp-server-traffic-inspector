@@ -52,3 +52,23 @@ _Avoid_: NetworkGraph (网络图谱), ServiceMap (服务地图), NodeList (节�
 按进程家族内各主/子进程细分统计的流量消耗、报文计数与协议分布多维矩阵视图。
 _Avoid_: ProcessStats (进程统计), ProcessBreakdown (进程细分)
 
+**TcpStream (TCP 会话流)**:
+在底层网络抓包文件中由两端四层套接字元组唯一标识、按时间序列连续交互的端到端单向或双向通信流。
+_Avoid_: TcpSession (TCP 会话), RawSocket (裸套接字), WireStream (网线流)
+
+**TcpStreamChunk (TCP 流切片)**:
+归属于特定 `TcpStream`、由同一方向连续传输的一组应用层报文载荷聚合而成的结构化时序交互块。
+_Avoid_: PacketChunk (数据包块), SegmentSlice (段切片), MessageBlock (消息块)
+
+**WebSocketMessage (WebSocket 消息)**:
+依托七层 HTTP 握手升级长连接建立后，在客户端与服务端之间双向流转的单条结构化帧载荷单元。
+_Avoid_: WsFrame (WS 帧), SocketMsg (套接字消息), PushEvent (推送事件)
+
+**ProxyRedirectionNotice (代理重定向感知通知)**:
+在双轨抓包环境下，系统检测到目标流量已被上层代理接管至本地环回而未经过物理网卡时生成的自解释拓扑诊断提示。
+_Avoid_: DropWarning (丢包警告), FilterAlert (过滤告警), RouteError (路由错误)
+
+**HarArchive (HAR 归档)**:
+遵循 HTTP Archive 1.2 规范的结构化归档文件，用于无损固化与外发交付完整抓包生命周期内的 HTTP 流及长连接帧记录。
+_Avoid_: TrafficExport (流量导出), HttpDump (HTTP 转储), SessionLog (会话日志)
+
