@@ -87,11 +87,50 @@ class HarExporter:
                 [resolved_session_id],
             ).fetchall()
 
+            ws_by_flow: dict[str, list[dict[str, Any]]] = {}
+            try:
+                ws_rows = conn.execute(
+                    """
+                    SELECT id, flow_id, timestamp, direction, opcode, opcode_name,
+                           is_binary, payload_preview, payload_blob, payload_path
+                    FROM ws_messages
+                    WHERE session_id = ?
+                    ORDER BY timestamp ASC;
+                    """,
+                    [resolved_session_id],
+                ).fetchall()
+                for wsr in ws_rows:
+                    fid = str(wsr["flow_id"])
+                    if fid not in ws_by_flow:
+                        ws_by_flow[fid] = []
+                    raw_b = self.storage.resolve_raw_body(wsr["payload_blob"], wsr["payload_path"])
+                    if wsr["is_binary"]:
+                        data_str = base64.b64encode(raw_b).decode("ascii") if raw_b else ""
+                    else:
+                        data_str = (
+                            raw_b.decode("utf-8", errors="replace")
+                            if raw_b
+                            else (wsr["payload_preview"] or "")
+                        )
+                    ws_by_flow[fid].append(
+                        {
+                            "type": (
+                                "send" if str(wsr["direction"]) == "client_to_server" else "receive"
+                            ),
+                            "time": float(wsr["timestamp"]),
+                            "opcode": int(wsr["opcode"]),
+                            "data": data_str,
+                        }
+                    )
+            except Exception as exc:
+                logger.debug("读取 WebSocket 消息失败或表未就绪: %s", exc)
+
         # 2. 组装 HAR 1.2 entries 列表（会话无流量时导出合法空 entries 归档，确保契约始终合法）
         entries: list[dict[str, Any]] = []
         if rows:
             for r in rows:
-                entry = self._build_har_entry(r)
+                fid = str(r["id"])
+                entry = self._build_har_entry(r, ws_messages=ws_by_flow.get(fid))
                 entries.append(entry)
 
         har_content = {
@@ -128,7 +167,11 @@ class HarExporter:
             "file_size_bytes": file_size,
         }
 
-    def _build_har_entry(self, row: Any) -> dict[str, Any]:
+    def _build_har_entry(
+        self,
+        row: Any,
+        ws_messages: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """将一条数据库 http_flows 行记录组装为 HAR 1.2 Entry。"""
         # 1. 时间戳转换与基础指标提取
         ts = float(row["timestamp"])
@@ -196,7 +239,7 @@ class HarExporter:
             "bodySize": int(row["response_body_size"] or 0),
         }
 
-        return {
+        entry: dict[str, Any] = {
             "startedDateTime": dt_str,
             "time": duration_ms,
             "request": req_entry,
@@ -208,6 +251,10 @@ class HarExporter:
                 "receive": 0,
             },
         }
+        if ws_messages:
+            entry["_webSocketMessages"] = ws_messages
+
+        return entry
 
     def _encode_body_for_har(self, data: bytes, mime_type: str) -> dict[str, Any]:
         """将请求体字节转为 HAR postData 结构。"""

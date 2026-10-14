@@ -295,6 +295,66 @@ class TrafficCaptureAddon:
         """
         self._persist_flow(flow, has_error=True)
 
+    def websocket_message(self, flow: Any) -> None:
+        """mitmproxy WebSocket 帧到达事件钩子，提取消息方向、Opcode 与载荷写入 SQLite。
+
+        Args:
+            flow: mitmproxy HTTPFlow 实例。
+        """
+        ws = getattr(flow, "websocket", None)
+        if ws is None:
+            return
+        messages = getattr(ws, "messages", None)
+        if not messages:
+            return
+        latest_msg = messages[-1]
+
+        # 1. 过滤 host 采集规则
+        req = getattr(flow, "request", None)
+        host = str(getattr(req, "pretty_host", None) or getattr(req, "host", "") or "")
+        if not _matches_filter_host(host, self.filter_host):
+            return
+
+        # 2. 提取帧属性
+        flow_id = str(getattr(flow, "id", None) or uuid4().hex)
+        from_client = bool(getattr(latest_msg, "from_client", True))
+        direction = "client_to_server" if from_client else "server_to_client"
+        msg_type = getattr(latest_msg, "type", 1)
+
+        opcode = 1
+        opcode_name = "TEXT"
+        if hasattr(msg_type, "value") and hasattr(msg_type, "name"):
+            try:
+                opcode = int(msg_type.value)
+            except (ValueError, TypeError):
+                opcode = 1
+            opcode_name = str(msg_type.name)
+        elif isinstance(msg_type, int):
+            opcode = msg_type
+            opcode_map = {1: "TEXT", 2: "BINARY", 8: "CLOSE", 9: "PING", 10: "PONG"}
+            opcode_name = opcode_map.get(opcode, "UNKNOWN")
+        elif isinstance(msg_type, str):
+            opcode_name = msg_type.upper()
+            reverse_map = {"TEXT": 1, "BINARY": 2, "CLOSE": 8, "PING": 9, "PONG": 10}
+            opcode = reverse_map.get(opcode_name, 1)
+
+        content = getattr(latest_msg, "content", b"")
+        timestamp = float(getattr(latest_msg, "timestamp", None) or time.time())
+
+        # 3. 写入共享存储
+        try:
+            self.storage.record_websocket_message(
+                flow_id=flow_id,
+                session_id=self.session_id,
+                timestamp=timestamp,
+                direction=direction,
+                opcode=opcode,
+                opcode_name=opcode_name,
+                content=content,
+            )
+        except Exception as exc:
+            logger.warning("写入 WebSocket 帧消息失败 (flow=%s): %s", flow_id, exc)
+
 
 addons: list[TrafficCaptureAddon] = (
     [TrafficCaptureAddon.from_env()] if os.environ.get("MCP_CAPTURE_DB_PATH") else []

@@ -258,16 +258,26 @@ async def test_ops_mcp_tools_registration(tmp_path: Path) -> None:
     tools = await server.list_tools()
     tool_names = [t.name for t in tools]
 
-    assert len(tool_names) == 19
+    assert len(tool_names) == 23
     assert "get_ca_certificate" in tool_names
     assert "toggle_system_proxy" in tool_names
     assert "get_system_proxy_status" in tool_names
     assert "export_http_session" in tool_names
+    assert "list_tcp_streams" in tool_names
+    assert "follow_tcp_stream" in tool_names
+    assert "list_websocket_messages" in tool_names
+    assert "get_websocket_message_detail" in tool_names
 
-    # 调用 get_ca_certificate
+    # 调用 get_ca_certificate (不带参数与带 install_to_system=True)
     ca_res = await server.call_tool("get_ca_certificate", {})
     ca_data = ca_res[0].text if hasattr(ca_res[0], "text") else str(ca_res)
     assert "instructions" in ca_data
+
+    ca_install_res = await server.call_tool("get_ca_certificate", {"install_to_system": True})
+    ca_install_data = (
+        ca_install_res[0].text if hasattr(ca_install_res[0], "text") else str(ca_install_res)
+    )
+    assert "installed" in ca_install_data
 
     # 调用 get_system_proxy_status
     status_res = await server.call_tool("get_system_proxy_status", {})

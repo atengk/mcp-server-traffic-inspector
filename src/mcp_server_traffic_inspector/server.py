@@ -336,6 +336,56 @@ def _register_manipulation_tools(
         """
         return storage.clear_intercept_rules(rule_id=rule_id)
 
+    @mcp.tool()
+    def list_websocket_messages(
+        flow_id: str | None = None,
+        session_id: str | None = None,
+        include_heartbeats: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """按握手流或会话分页查询已捕获的 WebSocket 消息帧列表（可过滤心跳帧）。
+
+        Args:
+            flow_id: 可选的握手 HttpFlow 唯一 ID。
+            session_id: 可选的抓包会话 ID。
+            include_heartbeats: 是否包含 PING/PONG 心跳消息帧，默认 False（自动抑制）。
+            limit: 单页返回最大帧数，默认 100。
+            offset: 分页偏移量，默认 0。
+
+        Returns:
+            包含 total、flow_id 与 messages 列表的字典；无匹配时 messages 固定为 []。
+        """
+        return storage.list_websocket_messages(
+            flow_id=flow_id,
+            session_id=session_id,
+            include_heartbeats=include_heartbeats,
+            limit=limit,
+            offset=offset,
+        )
+
+    @mcp.tool()
+    def get_websocket_message_detail(
+        message_id: str,
+        max_body_chars: int = 2048,
+        dump_to_file: bool = False,
+    ) -> dict[str, Any] | None:
+        """获取单个 WebSocket 消息帧的完整解码内容、Opcode 属性与可选落盘文件路径。
+
+        Args:
+            message_id: 目标 WebSocket 消息的唯一 ID。
+            max_body_chars: 文本预览最大截断字符数，默认 2048。
+            dump_to_file: 是否将完整载荷导出为独立本地文件并返回绝对路径。
+
+        Returns:
+            消息详情字典；若 message_id 不存在则返回 None。
+        """
+        return storage.get_websocket_message_detail(
+            message_id=message_id,
+            max_body_chars=max_body_chars,
+            dump_to_file=dump_to_file,
+        )
+
 
 def _register_pcap_tools(
     mcp: FastMCP,
@@ -424,6 +474,44 @@ def _register_pcap_tools(
             limit=limit,
         )
 
+    @mcp.tool()
+    def list_tcp_streams(
+        file_path: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """从指定的离线 PCAP 文件中提取并枚举所有 TCP 会话流及其端点、包数与载荷大小。
+
+        Args:
+            file_path: 目标 PCAP 本地文件路径。
+            limit: 最大返回流条数，默认 50。
+
+        Returns:
+            按 stream_id 升序排列的 TCP 流列表；无匹配时返回空列表 []。
+        """
+        return pcap_manager.list_tcp_streams(file_path=file_path, limit=limit)
+
+    @mcp.tool()
+    def follow_tcp_stream(
+        file_path: str,
+        stream_id: int,
+        format: str = "turns",
+    ) -> dict[str, Any]:
+        """重组并跟踪指定 TCP 流的数据交互，按客户端与服务端方向聚合为回合 (Turns)。
+
+        Args:
+            file_path: 目标 PCAP 本地文件路径。
+            stream_id: 待跟踪的 TCP 流 ID（如 0, 1）。
+            format: 数据组织格式，支持 'turns'（默认回合制）、'raw' 与 'hex'。
+
+        Returns:
+            包含客户端/服务端端点、回合统计与时序报文数据的结构化字典。
+        """
+        return pcap_manager.follow_tcp_stream(
+            file_path=file_path,
+            stream_id=stream_id,
+            format=format,
+        )
+
 
 def _register_diagnostic_tools(
     mcp: FastMCP,
@@ -471,13 +559,19 @@ def _register_ops_tools(
     """注册 CA 证书指引、跨平台系统代理托管与 HAR 会话归档导出工具集。"""
 
     @mcp.tool()
-    def get_ca_certificate() -> dict[str, Any]:
-        """获取 mitmproxy 本地 CA 根证书路径及 Windows/Linux 信任安装指引。
+    def get_ca_certificate(
+        install_to_system: bool = False,
+    ) -> dict[str, Any]:
+        """获取 mitmproxy 本地 CA 根证书路径及跨平台信任安装指引，在 Windows 上支持自动导入。
+
+        Args:
+            install_to_system: 是否在 Windows 自动执行 certutil 安装至受信任根证书库，
+                默认 False。
 
         Returns:
-            包含证书文件路径与系统证书库导入命令指引的结构化字典。
+            包含证书文件路径、安装指引及可选安装执行结果的结构化字典。
         """
-        return get_ca_cert_info()
+        return get_ca_cert_info(install_to_system=install_to_system)
 
     @mcp.tool()
     def toggle_system_proxy(
@@ -561,7 +655,7 @@ def create_mcp_server(
         lifecycle: 可选的生命周期管理器；传入时自动注册子进程与代理状态停止钩子。
 
     Returns:
-        完成全部 19 个工具注册的 FastMCP 服务对象。
+        完成全部 23 个工具注册的 FastMCP 服务对象。
     """
     # 1. 初始化共享 SQLite WAL 数据总线与核心业务管理器
     bus = storage or StorageBus.from_config(config)

@@ -33,21 +33,25 @@ def test_parse_interface_list_handles_windows_and_linux_formats() -> None:
         "index": 1,
         "name": "\\Device\\NPF_{1234-ABCD}",
         "description": "Ethernet 2",
+        "friendly_name": "Ethernet 2",
     }
     assert interfaces[1] == {
         "index": 2,
         "name": "eth0",
         "description": "Primary Network",
+        "friendly_name": "Primary Network",
     }
     assert interfaces[2] == {
         "index": 3,
         "name": "lo",
         "description": "Loopback Interface",
+        "friendly_name": "Loopback Interface",
     }
     assert interfaces[3] == {
         "index": 4,
         "name": "\\Device\\NPF_Loopback",
         "description": "\\Device\\NPF_Loopback",
+        "friendly_name": "\\Device\\NPF_Loopback",
     }
 
     assert parse_interface_list("") == []

@@ -31,6 +31,11 @@ from mcp_server_traffic_inspector.process_tracker import (
     ProcessInfo,
     SocketEntry,
 )
+from mcp_server_traffic_inspector.storage import (
+    DEFAULT_PREVIEW_CHARS,
+    _decode_preview,
+    _is_binary_payload,
+)
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -73,11 +78,13 @@ def parse_interface_list(tshark_output: str) -> list[dict[str, Any]]:
         match = line_pattern.match(line)
         if match:
             idx_str, name, desc = match.groups()
+            friendly = desc.strip() if desc else name.strip()
             interfaces.append(
                 {
                     "index": int(idx_str),
                     "name": name.strip(),
                     "description": desc.strip() if desc else name.strip(),
+                    "friendly_name": friendly,
                 }
             )
 
@@ -205,6 +212,258 @@ def parse_tshark_fields_output(
     }
 
 
+def parse_tcp_streams_output(
+    tsv_lines: Sequence[str],
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """解析 tshark 导出的 TCP 流报文行，聚合为 TCP 会话流摘要列表。
+
+    Args:
+        tsv_lines: 制表符分隔的 tshark 提取字段文本行。
+        limit: 最大返回流条数，默认 50。
+
+    Returns:
+        按 stream_id 聚合的 TCP 流列表；无匹配时返回空列表 []。
+    """
+    streams: dict[int, dict[str, Any]] = {}
+
+    for raw_line in tsv_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        cols = line.split("\t")
+        while len(cols) < 11:
+            cols.append("")
+
+        (
+            stream_str,
+            ip_src,
+            ip_dst,
+            ipv6_src,
+            ipv6_dst,
+            tcp_srcport,
+            tcp_dstport,
+            proto_col,
+            tcp_len_str,
+            tls_sni,
+            http_host,
+        ) = cols[:11]
+
+        if not stream_str.strip():
+            continue
+        try:
+            stream_id = int(stream_str.strip())
+        except ValueError:
+            continue
+
+        src_ip = ip_src.strip() or ipv6_src.strip()
+        dst_ip = ip_dst.strip() or ipv6_dst.strip()
+        src_port = int(tcp_srcport.strip()) if tcp_srcport.strip().isdigit() else 0
+        dst_port = int(tcp_dstport.strip()) if tcp_dstport.strip().isdigit() else 0
+        tcp_len = int(tcp_len_str.strip()) if tcp_len_str.strip().isdigit() else 0
+
+        sni = tls_sni.strip() or http_host.strip() or None
+
+        if stream_id not in streams:
+            streams[stream_id] = {
+                "stream_id": stream_id,
+                "client": f"{src_ip}:{src_port}",
+                "server": f"{dst_ip}:{dst_port}",
+                "client_ip": src_ip,
+                "client_port": src_port,
+                "server_ip": dst_ip,
+                "server_port": dst_port,
+                "packet_count": 0,
+                "payload_bytes": 0,
+                "protocol": proto_col.strip() or "TCP",
+                "sni_or_host": sni,
+            }
+
+        curr = streams[stream_id]
+        curr["packet_count"] += 1
+        curr["payload_bytes"] += tcp_len
+        if sni and not curr["sni_or_host"]:
+            curr["sni_or_host"] = sni
+        p = proto_col.strip()
+        if p and p.upper() not in ("TCP", "IP", "IPV6") and curr["protocol"] == "TCP":
+            curr["protocol"] = p
+
+    sorted_streams = sorted(streams.values(), key=lambda s: s["stream_id"])
+    return sorted_streams[: max(1, int(limit))]
+
+
+def parse_tcp_stream_turns_output(
+    tsv_lines: Sequence[str],
+    stream_id: int,
+    format: str = "turns",
+) -> dict[str, Any]:
+    """解析指定 TCP 流的 payload 字段行，按方向聚合为交互回合 (Turns) 或原始报文流。
+
+    Args:
+        tsv_lines: 制表符分隔的 tshark 提取字段文本行。
+        stream_id: 目标 TCP 流 ID。
+        format: 格式化方式（'turns'、'raw'、'hex'），默认 'turns'。
+
+    Returns:
+        包含流端点、回合统计与按交互时序聚合数据的字典。
+    """
+    client_endpoint: tuple[str, int] | None = None
+    server_endpoint: tuple[str, int] | None = None
+    raw_packets: list[dict[str, Any]] = []
+
+    for raw_line in tsv_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        cols = line.split("\t")
+        while len(cols) < 9:
+            cols.append("")
+
+        (
+            frame_num_str,
+            time_epoch_str,
+            ip_src,
+            ip_dst,
+            ipv6_src,
+            ipv6_dst,
+            tcp_srcport,
+            tcp_dstport,
+            payload_hex_raw,
+        ) = cols[:9]
+
+        payload_clean = payload_hex_raw.replace(":", "").replace(" ", "").strip()
+        if not payload_clean:
+            continue
+        try:
+            payload_bytes = bytes.fromhex(payload_clean)
+        except ValueError:
+            continue
+
+        src_ip = ip_src.strip() or ipv6_src.strip()
+        dst_ip = ip_dst.strip() or ipv6_dst.strip()
+        src_port = int(tcp_srcport.strip()) if tcp_srcport.strip().isdigit() else 0
+        dst_port = int(tcp_dstport.strip()) if tcp_dstport.strip().isdigit() else 0
+        epoch_time = float(time_epoch_str.strip()) if time_epoch_str.strip() else 0.0
+        frame_num = int(frame_num_str.strip()) if frame_num_str.strip().isdigit() else 0
+
+        if client_endpoint is None:
+            client_endpoint = (src_ip, src_port)
+            server_endpoint = (dst_ip, dst_port)
+
+        direction = (
+            "client_to_server" if (src_ip, src_port) == client_endpoint else "server_to_client"
+        )
+
+        raw_packets.append(
+            {
+                "frame_number": frame_num,
+                "timestamp": epoch_time,
+                "direction": direction,
+                "payload_bytes": payload_bytes,
+            }
+        )
+
+    client_str = f"{client_endpoint[0]}:{client_endpoint[1]}" if client_endpoint else "unknown"
+    server_str = f"{server_endpoint[0]}:{server_endpoint[1]}" if server_endpoint else "unknown"
+
+    if not raw_packets:
+        return {
+            "stream_id": stream_id,
+            "client": client_str,
+            "server": server_str,
+            "total_turns": 0,
+            "total_bytes": 0,
+            "format": format,
+            "turns": [],
+        }
+
+    turns: list[dict[str, Any]] = []
+    current_direction = raw_packets[0]["direction"]
+    current_bytes = bytearray()
+    turn_packet_count = 0
+    turn_start_time = raw_packets[0]["timestamp"]
+    turn_end_time = raw_packets[0]["timestamp"]
+    turn_index = 1
+    total_stream_bytes = 0
+
+    def _flush_turn(
+        idx: int,
+        direction: str,
+        b_data: bytes,
+        pkt_cnt: int,
+        t_start: float,
+        t_end: float,
+    ) -> dict[str, Any]:
+        is_binary = _is_binary_payload(b_data, None)
+        text_payload, truncated = _decode_preview(b_data, is_binary, DEFAULT_PREVIEW_CHARS)
+        turn_obj: dict[str, Any] = {
+            "turn_index": idx,
+            "direction": direction,
+            "packet_count": pkt_cnt,
+            "byte_count": len(b_data),
+            "start_time": t_start,
+            "end_time": t_end,
+            "is_binary": is_binary,
+            "payload_preview": text_payload,
+            "truncated": truncated,
+        }
+        if format == "hex":
+            turn_obj["payload_hex"] = b_data.hex()
+        elif format == "raw" and not is_binary:
+            turn_obj["payload_raw"] = b_data.decode("utf-8", errors="replace")
+        return turn_obj
+
+    for pkt in raw_packets:
+        p_dir = pkt["direction"]
+        p_bytes = pkt["payload_bytes"]
+        p_time = pkt["timestamp"]
+        total_stream_bytes += len(p_bytes)
+
+        if p_dir == current_direction:
+            current_bytes.extend(p_bytes)
+            turn_packet_count += 1
+            turn_end_time = p_time
+        else:
+            turns.append(
+                _flush_turn(
+                    turn_index,
+                    current_direction,
+                    bytes(current_bytes),
+                    turn_packet_count,
+                    turn_start_time,
+                    turn_end_time,
+                )
+            )
+            turn_index += 1
+            current_direction = p_dir
+            current_bytes = bytearray(p_bytes)
+            turn_packet_count = 1
+            turn_start_time = p_time
+            turn_end_time = p_time
+
+    if current_bytes:
+        turns.append(
+            _flush_turn(
+                turn_index,
+                current_direction,
+                bytes(current_bytes),
+                turn_packet_count,
+                turn_start_time,
+                turn_end_time,
+            )
+        )
+
+    return {
+        "stream_id": stream_id,
+        "client": client_str,
+        "server": server_str,
+        "total_turns": len(turns),
+        "total_bytes": total_stream_bytes,
+        "format": format,
+        "turns": turns,
+    }
+
+
 def _default_spawner(cmd: list[str], env: dict[str, str]) -> WorkerProcessProtocol:
     return subprocess.Popen(
         cmd,
@@ -295,6 +554,37 @@ class PcapCaptureManager:
         output = self._runner(cmd)
         return parse_interface_list(output)
 
+    def _normalize_interface(self, iface: int | str) -> str:
+        """归一化网卡标识符为 tshark 能够识别的接口名或索引。
+
+        支持用户传入友好名称（如 'WLAN'、'以太网'）、数字索引（如 1、'1'）或直接设备名。
+
+        Args:
+            iface: 网卡索引、名称或友好别名。
+
+        Returns:
+            可直接用于 tshark -i 的参数字符串。
+        """
+        if isinstance(iface, int):
+            return str(iface)
+        target = str(iface).strip()
+        if not target or target.isdigit():
+            return target or "1"
+
+        try:
+            available = self.list_interfaces()
+            target_lower = target.lower()
+            for item in available:
+                name = str(item.get("name", "")).strip()
+                desc = str(item.get("description", "")).strip()
+                friendly = str(item.get("friendly_name", "")).strip()
+                if target_lower in (name.lower(), desc.lower(), friendly.lower()):
+                    return name or str(item.get("index", target))
+        except Exception as exc:
+            logger.debug("归一化网卡名称失败，回退至原始参数: %s", exc)
+
+        return target
+
     def start_capture(
         self,
         *,
@@ -367,10 +657,11 @@ class PcapCaptureManager:
             self._active_tracker.start()
 
         # 3. 构建并启动实施双重安全熔断的 tshark 子进程
+        resolved_iface = self._normalize_interface(interface)
         cmd = [
             str(tshark_bin),
             "-i",
-            str(interface),
+            resolved_iface,
             "-w",
             str(capture_file),
             "-c",
@@ -608,3 +899,121 @@ class PcapCaptureManager:
             analysis["server_topology"] = sidecar_meta.get("server_topology", [])
 
         return analysis
+
+    def list_tcp_streams(
+        self,
+        file_path: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """从指定的离线 PCAP 文件中提取并枚举所有 TCP 会话流及其端点、包数与载荷大小。
+
+        Args:
+            file_path: 目标 PCAP 本地文件绝对或相对路径。
+            limit: 最大返回流条数，默认 50。
+
+        Returns:
+            按 stream_id 升序排列的 TCP 流列表；无匹配时返回空列表 []。
+
+        Raises:
+            ValueError: 当指定文件不存在时抛出。
+            RuntimeError: 当 tshark 引擎不可用时抛出。
+        """
+        path_obj = Path(file_path.strip()).expanduser().resolve()
+        if not path_obj.is_file():
+            raise ValueError(f"PCAP 文件不存在: {file_path}")
+
+        tshark_bin = self._resolve_binary()
+        cmd = [
+            str(tshark_bin),
+            "-r",
+            str(path_obj),
+            "-Y",
+            "tcp",
+            "-T",
+            "fields",
+            "-e",
+            "tcp.stream",
+            "-e",
+            "ip.src",
+            "-e",
+            "ip.dst",
+            "-e",
+            "ipv6.src",
+            "-e",
+            "ipv6.dst",
+            "-e",
+            "tcp.srcport",
+            "-e",
+            "tcp.dstport",
+            "-e",
+            "_ws.col.Protocol",
+            "-e",
+            "tcp.len",
+            "-e",
+            "tls.handshake.extensions_server_name",
+            "-e",
+            "http.host",
+        ]
+        output = self._runner(cmd)
+        tsv_lines = [line for line in output.splitlines() if line.strip()]
+        return parse_tcp_streams_output(tsv_lines, limit=limit)
+
+    def follow_tcp_stream(
+        self,
+        file_path: str,
+        stream_id: int,
+        format: str = "turns",
+    ) -> dict[str, Any]:
+        """重组并跟踪指定 TCP 流的数据交互，按客户端与服务端方向聚合为回合 (Turns)。
+
+        Args:
+            file_path: 目标 PCAP 本地文件绝对或相对路径。
+            stream_id: 待跟踪的 TCP 流 ID（如 0, 1）。
+            format: 数据组织格式，支持 'turns'（默认回合制）、'raw' 与 'hex'。
+
+        Returns:
+            包含客户端/服务端端点、回合统计与时序报文数据的结构化字典。
+
+        Raises:
+            ValueError: 当指定文件不存在时抛出。
+            RuntimeError: 当 tshark 引擎不可用时抛出。
+        """
+        path_obj = Path(file_path.strip()).expanduser().resolve()
+        if not path_obj.is_file():
+            raise ValueError(f"PCAP 文件不存在: {file_path}")
+
+        tshark_bin = self._resolve_binary()
+        cmd = [
+            str(tshark_bin),
+            "-r",
+            str(path_obj),
+            "-Y",
+            f"tcp.stream eq {int(stream_id)} and tcp.len > 0",
+            "-T",
+            "fields",
+            "-e",
+            "frame.number",
+            "-e",
+            "frame.time_epoch",
+            "-e",
+            "ip.src",
+            "-e",
+            "ip.dst",
+            "-e",
+            "ipv6.src",
+            "-e",
+            "ipv6.dst",
+            "-e",
+            "tcp.srcport",
+            "-e",
+            "tcp.dstport",
+            "-e",
+            "tcp.payload",
+        ]
+        output = self._runner(cmd)
+        tsv_lines = [line for line in output.splitlines() if line.strip()]
+        return parse_tcp_stream_turns_output(
+            tsv_lines=tsv_lines,
+            stream_id=int(stream_id),
+            format=format,
+        )

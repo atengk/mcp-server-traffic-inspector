@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,14 +22,18 @@ logger = logging.getLogger("mcp_server_traffic_inspector.system_proxy")
 INTERNET_SETTINGS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
 
-def get_ca_certificate(custom_cert_dir: Path | None = None) -> dict[str, Any]:
-    """获取 mitmproxy 本地 CA 根证书路径及跨平台信任安装指引。
+def get_ca_certificate(
+    custom_cert_dir: Path | None = None,
+    install_to_system: bool = False,
+) -> dict[str, Any]:
+    """获取 mitmproxy 本地 CA 根证书路径及跨平台信任安装指引，在 Windows 上支持自动导入。
 
     Args:
         custom_cert_dir: 可选的自定义证书目录；未指定时默认使用用户主目录下 .mitmproxy。
+        install_to_system: 是否在 Windows 上自动执行 certutil 安装至受信任根证书库，默认 False。
 
     Returns:
-        包含证书存在状态、文件绝对路径及 Windows/Linux 信任安装命令指引的字典。
+        包含证书存在状态、文件绝对路径及 Windows/Linux 信任安装命令指引与安装结果的字典。
     """
     cert_dir = custom_cert_dir or (Path.home() / ".mitmproxy")
     pem_path = cert_dir / "mitmproxy-ca-cert.pem"
@@ -59,6 +64,34 @@ def get_ca_certificate(custom_cert_dir: Path | None = None) -> dict[str, Any]:
         ],
     }
 
+    installed = False
+    install_output = ""
+    if install_to_system:
+        if not exists:
+            install_output = "证书文件尚不存在，无法执行自动安装。请先启动一次抓包生成证书。"
+        elif sys.platform == "win32":
+            target_install_file = pem_str or cer_str
+            try:
+                cmd = ["certutil", "-addstore", "-user", "Root", str(target_install_file)]
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15.0,
+                    check=False,
+                )
+                install_output = (res.stdout or res.stderr or "").strip()
+                installed = res.returncode == 0
+            except Exception as exc:
+                install_output = f"执行 certutil 安装异常: {exc}"
+                installed = False
+        else:
+            install_output = (
+                "非 Windows 平台不支持自动调用 certutil，请根据 instructions 中的指引手动执行。"
+            )
+
     if exists:
         message = "成功定位到 mitmproxy 本地 CA 根证书，请根据操作系统指引将其添加到受信任证书库。"
     else:
@@ -67,7 +100,7 @@ def get_ca_certificate(custom_cert_dir: Path | None = None) -> dict[str, Any]:
             "mitmproxy 将在首次启动 HTTP 抓包时自动生成该证书。"
         )
 
-    return {
+    res_dict: dict[str, Any] = {
         "exists": exists,
         "ca_pem_path": pem_str,
         "ca_cer_path": cer_str,
@@ -75,6 +108,11 @@ def get_ca_certificate(custom_cert_dir: Path | None = None) -> dict[str, Any]:
         "instructions": instructions,
         "message": message,
     }
+    if install_to_system:
+        res_dict["installed"] = installed
+        res_dict["install_output"] = install_output
+
+    return res_dict
 
 
 class SystemProxyManager:

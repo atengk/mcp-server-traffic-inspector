@@ -89,6 +89,26 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     modify_response_headers TEXT,
     created_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ws_messages (
+    id TEXT PRIMARY KEY,
+    flow_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    direction TEXT NOT NULL,
+    opcode INTEGER NOT NULL,
+    opcode_name TEXT NOT NULL,
+    is_heartbeat INTEGER DEFAULT 0,
+    content_length INTEGER DEFAULT 0,
+    is_binary INTEGER DEFAULT 0,
+    payload_preview TEXT,
+    payload_blob BLOB,
+    payload_path TEXT,
+    FOREIGN KEY(flow_id) REFERENCES http_flows(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_ws_flow ON ws_messages(flow_id, timestamp ASC);
+CREATE INDEX IF NOT EXISTS idx_ws_session ON ws_messages(session_id, timestamp ASC);
+CREATE INDEX IF NOT EXISTS idx_ws_heartbeat ON ws_messages(flow_id, is_heartbeat);
 """
 
 
@@ -855,6 +875,246 @@ class StorageBus:
         return {
             "cleared_count": cleared,
             "target_rule_id": target,
+        }
+
+    def record_websocket_message(
+        self,
+        *,
+        flow_id: str,
+        session_id: str,
+        timestamp: float,
+        direction: str,
+        opcode: int,
+        opcode_name: str,
+        content: bytes | str,
+        message_id: str | None = None,
+    ) -> str:
+        """将捕获的 WebSocket 单帧元数据与 Payload 写入 SQLite WAL 数据总线。
+
+        超过 256KB 的载荷分流写入 bodies_dir 临时文件；低于 256KB 存入 BLOB。
+
+        Args:
+            flow_id: 归属的握手 HttpFlow 唯一标识。
+            session_id: 归属的 CaptureSession 唯一标识。
+            timestamp: 消息收发 Unix 时间戳（秒）。
+            direction: 消息传输方向（'client_to_server' 或 'server_to_client'）。
+            opcode: WebSocket Opcode 数值（1=TEXT, 2=BINARY, 8=CLOSE, 9=PING, 10=PONG）。
+            opcode_name: Opcode 文本枚举名称（如 'TEXT', 'PING'）。
+            content: 原始载荷字节或解码字符串。
+            message_id: 可选的消息唯一 ID，默认自动生成。
+
+        Returns:
+            成功入库的 message_id。
+        """
+        msg_id = message_id or f"ws_{uuid4().hex}"
+        raw_bytes = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        is_heartbeat = int(opcode in (9, 10) or opcode_name.upper() in ("PING", "PONG"))
+        is_binary = int(
+            opcode == 2 or opcode_name.upper() == "BINARY" or (b"\x00" in raw_bytes[:512])
+        )
+
+        preview, blob_val, is_bin_detected, path_val = self._prepare_body_storage(
+            flow_id=msg_id,
+            direction="req" if direction == "client_to_server" else "resp",
+            raw_bytes=raw_bytes,
+            content_type="application/octet-stream" if is_binary else "text/plain",
+        )
+
+        with closing(self._connect()) as conn:
+            # 1. 防御外键约束：若握手流因偶发时序尚未落盘，自动插入最小存根流
+            exists = conn.execute("SELECT 1 FROM http_flows WHERE id = ?;", (flow_id,)).fetchone()
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO http_flows (
+                        id, session_id, timestamp, method, scheme, host, port, path, status_code
+                    ) VALUES (?, ?, ?, 'GET', 'ws', 'unknown', 0, '/', 101);
+                    """,
+                    (flow_id, session_id, timestamp),
+                )
+
+            # 2. 插入 WebSocket 帧记录
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO ws_messages (
+                    id, flow_id, session_id, timestamp, direction, opcode, opcode_name,
+                    is_heartbeat, content_length, is_binary, payload_preview,
+                    payload_blob, payload_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    msg_id,
+                    flow_id,
+                    session_id,
+                    timestamp,
+                    direction,
+                    int(opcode),
+                    opcode_name.upper(),
+                    is_heartbeat,
+                    len(raw_bytes),
+                    int(is_binary or is_bin_detected),
+                    preview,
+                    blob_val,
+                    path_val,
+                ),
+            )
+            conn.commit()
+
+        return msg_id
+
+    def list_websocket_messages(
+        self,
+        *,
+        flow_id: str | None = None,
+        session_id: str | None = None,
+        include_heartbeats: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """按握手流或会话分页查询 WebSocket 消息帧列表（可过滤心跳帧）。
+
+        Args:
+            flow_id: 可选的握手 HttpFlow 唯一 ID。
+            session_id: 可选的抓包会话 ID。
+            include_heartbeats: 是否包含 PING/PONG 心跳消息帧，默认 False（自动抑制）。
+            limit: 单页返回最大帧数，默认 100。
+            offset: 分页偏移量，默认 0。
+
+        Returns:
+            包含 total、flow_id 与 messages 列表的字典；无匹配时 messages 返回空列表 []。
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if flow_id:
+            clauses.append("flow_id = ?")
+            params.append(flow_id)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if not include_heartbeats:
+            clauses.append("is_heartbeat = 0")
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with closing(self._connect()) as conn:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) FROM ws_messages {where_sql};",
+                params,
+            ).fetchone()
+            total = int(total_row[0]) if total_row else 0
+
+            query_sql = f"""
+                SELECT
+                    id, flow_id, session_id, timestamp, direction, opcode, opcode_name,
+                    is_heartbeat, content_length, is_binary, payload_preview
+                FROM ws_messages
+                {where_sql}
+                ORDER BY timestamp ASC
+                LIMIT ? OFFSET ?;
+            """
+            rows = conn.execute(
+                query_sql,
+                [*params, max(1, int(limit)), max(0, int(offset))],
+            ).fetchall()
+
+        messages: list[dict[str, Any]] = []
+        for r in rows:
+            messages.append(
+                {
+                    "id": str(r["id"]),
+                    "flow_id": str(r["flow_id"]),
+                    "session_id": str(r["session_id"]),
+                    "time": _format_iso_time(float(r["timestamp"])),
+                    "timestamp": float(r["timestamp"]),
+                    "direction": str(r["direction"]),
+                    "opcode": int(r["opcode"]),
+                    "opcode_name": str(r["opcode_name"]),
+                    "is_heartbeat": bool(r["is_heartbeat"]),
+                    "content_length": int(r["content_length"]),
+                    "is_binary": bool(r["is_binary"]),
+                    "payload_preview": r["payload_preview"] or "",
+                }
+            )
+
+        return {
+            "total": total,
+            "flow_id": flow_id,
+            "messages": messages,
+        }
+
+    def get_websocket_message_detail(
+        self,
+        message_id: str,
+        *,
+        max_body_chars: int = DEFAULT_PREVIEW_CHARS,
+        dump_to_file: bool = False,
+    ) -> dict[str, Any] | None:
+        """获取单个 WebSocket 消息帧的完整解压内容、Opcode 属性与可选落盘文件路径。
+
+        Args:
+            message_id: 目标 WebSocket 消息的唯一 ID。
+            max_body_chars: 文本预览最大截断字符数，默认 2048。
+            dump_to_file: 是否将完整载荷导出为独立本地文件并返回绝对路径。
+
+        Returns:
+            消息详情字典；若 message_id 不存在则返回 None。
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    id, flow_id, session_id, timestamp, direction, opcode, opcode_name,
+                    is_heartbeat, content_length, is_binary, payload_preview,
+                    payload_blob, payload_path
+                FROM ws_messages
+                WHERE id = ?;
+                """,
+                (message_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        raw_bytes = self.resolve_raw_body(row["payload_blob"], row["payload_path"])
+        is_binary = bool(row["is_binary"])
+        preview = row["payload_preview"] or ""
+        truncated = False
+        text_content = ""
+
+        if is_binary:
+            text_content = f"<binary payload: {len(raw_bytes)} bytes>"
+        else:
+            decoded = raw_bytes.decode("utf-8", errors="replace")
+            text_content = decoded
+            if len(decoded) > max_body_chars:
+                preview = decoded[:max_body_chars]
+                truncated = True
+            else:
+                preview = decoded
+
+        file_path = row["payload_path"]
+        if dump_to_file and raw_bytes and not file_path:
+            self.bodies_dir.mkdir(parents=True, exist_ok=True)
+            dumped = (self.bodies_dir / f"{message_id}.bin").resolve()
+            dumped.write_bytes(raw_bytes)
+            file_path = str(dumped)
+
+        return {
+            "id": str(row["id"]),
+            "flow_id": str(row["flow_id"]),
+            "session_id": str(row["session_id"]),
+            "time": _format_iso_time(float(row["timestamp"])),
+            "timestamp": float(row["timestamp"]),
+            "direction": str(row["direction"]),
+            "opcode": int(row["opcode"]),
+            "opcode_name": str(row["opcode_name"]),
+            "is_heartbeat": bool(row["is_heartbeat"]),
+            "content_length": int(row["content_length"]),
+            "is_binary": is_binary,
+            "preview": preview,
+            "truncated": truncated,
+            "content": text_content if not truncated else preview,
+            "file_path": file_path,
         }
 
     def verify_health(self) -> StorageHealth:
