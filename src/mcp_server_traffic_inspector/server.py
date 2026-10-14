@@ -672,7 +672,7 @@ def create_mcp_server(
         lifecycle.register(lambda: None if pcap_mgr.stop_capture() else None)
         lifecycle.register(lambda: sys_proxy.restore_initial_state())
 
-    # 2. 创建 FastMCP 主控实例并注册各领域工具集 (19 个 Tools)
+    # 2. 创建 FastMCP 主控实例并注册各领域工具集 (23 个 Tools)
     mcp = FastMCP(
         name=SERVER_NAME,
         instructions=SERVER_INSTRUCTIONS,

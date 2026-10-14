@@ -72,3 +72,7 @@ _Avoid_: DropWarning (丢包警告), FilterAlert (过滤告警), RouteError (路
 遵循 HTTP Archive 1.2 规范的结构化归档文件，用于无损固化与外发交付完整抓包生命周期内的 HTTP 流及长连接帧记录。
 _Avoid_: TrafficExport (流量导出), HttpDump (HTTP 转储), SessionLog (会话日志)
 
+**AutoLifecycle (全自动抓包生命周期)**:
+在抓包启停阶段自动协同证书托管、代理环境接管、智能权属安全复位与 HAR 归档导出的端到端受控闭环。
+_Avoid_: AutoPilot (自动驾驶), SilentMode (静默模式), ProxyDaemon (代理守护进程)
+
