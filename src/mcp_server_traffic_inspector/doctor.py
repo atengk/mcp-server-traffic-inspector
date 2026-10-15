@@ -315,14 +315,28 @@ def _check_ca_certificate() -> ComponentCheckResult:
     )
 
 
-def get_ca_env_vars() -> dict[str, str]:
-    """获取适配常见运行时（Python、Node.js、curl、git）的 CA 证书环境变量字典。"""
-    confdir = Path.home() / ".mitmproxy"
-    pem_cert = confdir / "mitmproxy-ca-cert.pem"
-    cer_cert = confdir / "mitmproxy-ca-cert.cer"
-    target = pem_cert if pem_cert.is_file() else (cer_cert if cer_cert.is_file() else None)
-    if target is None:
-        return {}
+def get_ca_env_vars(ca_cert_path: Path | str | None = None) -> dict[str, str]:
+    """获取适配常见运行时（Python、Node.js、curl、git）的 CA 证书环境变量字典。
+
+    Args:
+        ca_cert_path: 可选的显式 CA 证书文件路径；未指定时默认从 ~/.mitmproxy 目录检索。
+
+    Returns:
+        包含 SSL_CERT_FILE、REQUESTS_CA_BUNDLE 等环境变量键值映射的字典；
+        若未探测到可用证书文件则返回空字典 {}。
+    """
+    if ca_cert_path is not None:
+        target = Path(ca_cert_path)
+        if not target.is_file():
+            return {}
+    else:
+        confdir = Path.home() / ".mitmproxy"
+        pem_cert = confdir / "mitmproxy-ca-cert.pem"
+        cer_cert = confdir / "mitmproxy-ca-cert.cer"
+        target = pem_cert if pem_cert.is_file() else (cer_cert if cer_cert.is_file() else None)
+        if target is None:
+            return {}
+
     target_str = str(target.resolve())
     return {
         "SSL_CERT_FILE": target_str,
@@ -333,21 +347,30 @@ def get_ca_env_vars() -> dict[str, str]:
     }
 
 
-def trust_ca_certificate(system_wide: bool = False) -> dict[str, Any]:
+def trust_ca_certificate(
+    system_wide: bool = False,
+    ca_cert_path: Path | str | None = None,
+) -> dict[str, Any]:
     """将 mitmproxy CA 证书安装至操作系统受信任根证书库，并生成环境变量配置。
 
     Args:
         system_wide: Windows 下是否强制写入系统全局库（需要管理员权限），
             默认 False（当前用户根证书库，免提权）。
+        ca_cert_path: 可选的显式 CA 证书文件路径；未指定时默认从 ~/.mitmproxy 目录检索。
 
     Returns:
         包含 status、message、scope、cert_path 与 env_vars 的字典。
     """
-    confdir = Path.home() / ".mitmproxy"
-    pem_cert = confdir / "mitmproxy-ca-cert.pem"
-    cer_cert = confdir / "mitmproxy-ca-cert.cer"
-    target = cer_cert if cer_cert.is_file() else (pem_cert if pem_cert.is_file() else None)
-    env_vars = get_ca_env_vars()
+    if ca_cert_path is not None:
+        target_path = Path(ca_cert_path)
+        target = target_path if target_path.is_file() else None
+    else:
+        confdir = Path.home() / ".mitmproxy"
+        pem_cert = confdir / "mitmproxy-ca-cert.pem"
+        cer_cert = confdir / "mitmproxy-ca-cert.cer"
+        target = cer_cert if cer_cert.is_file() else (pem_cert if pem_cert.is_file() else None)
+
+    env_vars = get_ca_env_vars(ca_cert_path=target)
 
     if target is None:
         return {

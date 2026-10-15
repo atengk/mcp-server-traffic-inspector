@@ -31,38 +31,62 @@ from mcp_server_traffic_inspector.storage import StorageBus
 
 def test_ca_env_vars_and_trust(tmp_path: Path) -> None:
     """验证 CA 环境变量生成与证书信任安装调用。"""
-    envs = get_ca_env_vars()
-    assert "NODE_EXTRA_CA_CERTS" in envs
-    assert "SSL_CERT_FILE" in envs
-    assert "REQUESTS_CA_BUNDLE" in envs
-    assert "CURL_CA_BUNDLE" in envs
+    fake_home = tmp_path / "home"
+    mitm_dir = fake_home / ".mitmproxy"
+    mitm_dir.mkdir(parents=True, exist_ok=True)
+    fake_cert = mitm_dir / "mitmproxy-ca-cert.cer"
+    fake_cert.write_text("FAKE CERTIFICATE CONTENT", encoding="utf-8")
 
-    # 1. 模拟 Windows 当前用户免提权导入
-    with patch("sys.platform", "win32"):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="CertUtil: -addstore command completed successfully.",
-                stderr="",
-            )
-            res = trust_ca_certificate(system_wide=False)
-            assert res["status"] == "ok"
-            assert res["scope"] == "CurrentUser"
-            assert "NODE_EXTRA_CA_CERTS" in res["env_vars"]
-            # 校验 certutil 参数
-            called_args = mock_run.call_args[0][0]
-            assert "-user" in called_args
-            assert "Root" in called_args
+    # 1. 验证在 Path.home() 目录下检索证书时的环境变量生成与证书导入
+    with patch("pathlib.Path.home", return_value=fake_home):
+        envs = get_ca_env_vars()
+        assert "NODE_EXTRA_CA_CERTS" in envs
+        assert "SSL_CERT_FILE" in envs
+        assert "REQUESTS_CA_BUNDLE" in envs
+        assert "CURL_CA_BUNDLE" in envs
+        assert "GIT_SSL_CAINFO" in envs
+        assert envs["NODE_EXTRA_CA_CERTS"] == str(fake_cert.resolve())
 
-    # 2. 模拟系统级导入
-    with patch("sys.platform", "win32"):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="Success", stderr="")
-            res_sys = trust_ca_certificate(system_wide=True)
-            assert res_sys["status"] == "ok"
-            assert res_sys["scope"] == "LocalMachine"
-            called_args = mock_run.call_args[0][0]
-            assert "-user" not in called_args
+        # 模拟 Windows 当前用户免提权导入
+        with patch("sys.platform", "win32"):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(
+                    returncode=0,
+                    stdout="CertUtil: -addstore command completed successfully.",
+                    stderr="",
+                )
+                res = trust_ca_certificate(system_wide=False)
+                assert res["status"] == "ok"
+                assert res["scope"] == "CurrentUser"
+                assert "NODE_EXTRA_CA_CERTS" in res["env_vars"]
+                # 校验 certutil 参数
+                called_args = mock_run.call_args[0][0]
+                assert "-user" in called_args
+                assert "Root" in called_args
+
+        # 模拟系统级导入
+        with patch("sys.platform", "win32"):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="Success", stderr="")
+                res_sys = trust_ca_certificate(system_wide=True)
+                assert res_sys["status"] == "ok"
+                assert res_sys["scope"] == "LocalMachine"
+                called_args = mock_run.call_args[0][0]
+                assert "-user" not in called_args
+
+    # 2. 验证显式指定 ca_cert_path
+    custom_cert = tmp_path / "custom.pem"
+    custom_cert.write_text("CUSTOM CERT", encoding="utf-8")
+    custom_envs = get_ca_env_vars(ca_cert_path=custom_cert)
+    assert custom_envs["SSL_CERT_FILE"] == str(custom_cert.resolve())
+
+    # 3. 验证未找到证书时的防御性回退
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir(parents=True, exist_ok=True)
+    with patch("pathlib.Path.home", return_value=empty_home):
+        assert get_ca_env_vars() == {}
+        res_empty = trust_ca_certificate()
+        assert res_empty["status"] == "error"
 
 
 @pytest.mark.asyncio

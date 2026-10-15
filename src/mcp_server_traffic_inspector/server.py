@@ -583,6 +583,7 @@ def _register_ops_tools(
     @mcp.tool()
     def trust_ca_certificate(
         system_wide: bool = False,
+        ca_cert_path: str | None = None,
     ) -> dict[str, Any]:
         """将 mitmproxy CA 根证书导入系统信任库并提供常见运行时环境变量字典。
 
@@ -591,11 +592,12 @@ def _register_ops_tools(
 
         Args:
             system_wide: 是否尝试安装至系统级受信任根证书库（需要管理员权限），默认 False。
+            ca_cert_path: 可选的显式 CA 证书路径；为空时自动检索本地 ~/.mitmproxy 目录。
 
         Returns:
             包含 status、ca_cert_path、platform、system_wide、env_vars 及 details 的字典。
         """
-        return do_trust_ca(system_wide=system_wide)
+        return do_trust_ca(system_wide=system_wide, ca_cert_path=ca_cert_path)
 
     @mcp.tool()
     def get_ca_certificate(
