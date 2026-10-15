@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
@@ -514,6 +516,13 @@ class PcapCaptureManager:
         self._active_final_target: Path | None = None
         self._active_keep_raw: bool = False
 
+        # 受管 HTTP 代理端口动态解析器
+        self._proxy_port_resolver: Callable[[], int | None] | None = None
+
+    def set_proxy_port_resolver(self, resolver: Callable[[], int | None]) -> None:
+        """注册活跃 HTTP 抓包代理端口解析回调函数。"""
+        self._proxy_port_resolver = resolver
+
     def _run_command_sync(self, cmd: list[str]) -> str:
         try:
             completed = subprocess.run(
@@ -556,10 +565,23 @@ class PcapCaptureManager:
         output = self._runner(cmd)
         return parse_interface_list(output)
 
-    def _normalize_interface(self, iface: int | str) -> str:
-        """归一化网卡标识符为 tshark 能够识别的接口名或索引。
+    @staticmethod
+    def _is_loopback_interface(item: dict[str, Any]) -> bool:
+        name = str(item.get("name", "")).lower()
+        desc = str(item.get("description", "")).lower()
+        friendly = str(item.get("friendly_name", "")).lower()
+        return (
+            "loopback" in name
+            or "loopback" in desc
+            or "loopback" in friendly
+            or name in ("lo", "lo0")
+            or "npf_loopback" in name
+        )
 
-        支持用户传入友好名称（如 'WLAN'、'以太网'）、数字索引（如 1、'1'）或直接设备名。
+    def _normalize_interface(self, iface: int | str) -> str:
+        """归一化单网卡标识符为 tshark 能够识别的接口名或索引。
+
+        支持传入友好名称（如 'WLAN'）、数字索引（如 1）、'loopback' 别名或直接设备名。
 
         Args:
             iface: 网卡索引、名称或友好别名。
@@ -576,6 +598,15 @@ class PcapCaptureManager:
         try:
             available = self.list_interfaces()
             target_lower = target.lower()
+
+            # 1. 语义别名支持：loopback / lo / 127.0.0.1
+            if target_lower in ("loopback", "lo", "lo0", "npf_loopback", "127.0.0.1"):
+                for item in available:
+                    if self._is_loopback_interface(item):
+                        return str(item.get("name") or item.get("index"))
+                return r"\Device\NPF_Loopback" if sys.platform == "win32" else "lo"
+
+            # 2. 普通名称/描述/friendly_name 模糊比对
             for item in available:
                 name = str(item.get("name", "")).strip()
                 desc = str(item.get("description", "")).strip()
@@ -587,10 +618,62 @@ class PcapCaptureManager:
 
         return target
 
+    def _resolve_interfaces(self, iface: int | str | Sequence[int | str]) -> list[str]:
+        """解析并扩展网卡标识符为供 tshark -i 消费的网卡参数列表。
+
+        支持单网卡、网卡列表、逗号分隔字符串、'loopback' 以及 'auto' 双轨自适应。
+        """
+        if isinstance(iface, (list, tuple)):
+            res: list[str] = []
+            for sub in iface:
+                res.extend(self._resolve_interfaces(sub))
+            return res or ["1"]
+
+        if isinstance(iface, str) and "," in iface:
+            parts = [p.strip() for p in iface.split(",") if p.strip()]
+            return self._resolve_interfaces(parts)
+
+        target_str = str(iface).strip().lower()
+        if target_str == "auto":
+            try:
+                available = self.list_interfaces()
+                if not available:
+                    return ["1"]
+
+                loopback_item: dict[str, Any] | None = None
+                primary_physical: dict[str, Any] | None = None
+
+                for item in available:
+                    if self._is_loopback_interface(item):
+                        if loopback_item is None:
+                            loopback_item = item
+                    else:
+                        name_lower = str(item.get("name", "")).lower()
+                        if "etwdump" not in name_lower and primary_physical is None:
+                            primary_physical = item
+
+                chosen: list[str] = []
+                if primary_physical is not None:
+                    chosen.append(
+                        str(primary_physical.get("name") or primary_physical.get("index"))
+                    )
+                elif available:
+                    chosen.append(str(available[0].get("name") or available[0].get("index")))
+
+                if loopback_item is not None:
+                    chosen.append(str(loopback_item.get("name") or loopback_item.get("index")))
+
+                return chosen or ["1"]
+            except Exception as exc:
+                logger.debug("自动推导 auto 双轨网卡失败: %s", exc)
+                return ["1"]
+
+        return [self._normalize_interface(iface)]
+
     def start_capture(
         self,
         *,
-        interface: int | str = 1,
+        interface: int | str | Sequence[int | str] = 1,
         output_path: str | None = None,
         bpf_filter: str | None = None,
         max_packets: int = 2000,
@@ -606,7 +689,7 @@ class PcapCaptureManager:
         支持基于进程路径、进程名称或显式 PID 家族树追踪与后处理时空切片。
 
         Args:
-            interface: 网卡索引或名称，默认 1。
+            interface: 网卡索引、名称、'loopback'、'auto' 或网卡标识符列表，默认 1。
             output_path: 保存目标 .pcap 绝对路径；为空时自动生成于系统临时目录。
             bpf_filter: 可选的 BPF 抓包过滤表达式（如 'tcp port 80'）。
             max_packets: 最大抓包数熔断上限，默认 2000 包。
@@ -618,7 +701,7 @@ class PcapCaptureManager:
             keep_raw_pcap: 是否保留全量中间抓包文件，默认 False（自动清理）。
 
         Returns:
-            包含 status、interface、output_file、limits 及 process_filter 的字典。
+            包含状态、网卡、已解析网卡列表、输出路径及过滤元数据的字典。
         """
         # 1. 若已有运行中的实时抓包子进程，先执行安全停止
         if self._process is not None and self._process.poll() is None:
@@ -659,19 +742,21 @@ class PcapCaptureManager:
             self._active_tracker.start()
 
         # 3. 构建并启动实施双重安全熔断的 tshark 子进程
-        resolved_iface = self._normalize_interface(interface)
-        cmd = [
-            str(tshark_bin),
-            "-i",
-            resolved_iface,
-            "-w",
-            str(capture_file),
-            "-c",
-            str(max(1, int(max_packets))),
-            "-a",
-            f"duration:{max(1, int(duration_seconds))}",
-            "-q",
-        ]
+        resolved_ifaces = self._resolve_interfaces(interface)
+        cmd = [str(tshark_bin)]
+        for single_iface in resolved_ifaces:
+            cmd.extend(["-i", single_iface])
+        cmd.extend(
+            [
+                "-w",
+                str(capture_file),
+                "-c",
+                str(max(1, int(max_packets))),
+                "-a",
+                f"duration:{max(1, int(duration_seconds))}",
+                "-q",
+            ]
+        )
         if bpf_filter and bpf_filter.strip():
             cmd.extend(["-f", bpf_filter.strip()])
 
@@ -683,6 +768,7 @@ class PcapCaptureManager:
         result: dict[str, Any] = {
             "status": "capturing",
             "interface": interface,
+            "resolved_interfaces": resolved_ifaces,
             "output_file": str(target_path),
             "limits": {
                 "max_packets": int(max_packets),
@@ -774,35 +860,64 @@ class PcapCaptureManager:
             except Exception as exc:
                 logger.debug("统计 PCAP 文件包数失败: %s", exc)
 
-        # 4. 双轨抓包模式感知：检测流量是否完全被系统代理重定向至本地回环接口
+        # 4. 双轨抓包模式感知：检测流量是否被重定向至本地回环接口并区分协议类型
         redirection_notice: dict[str, Any] | None = None
         if is_process_mode and packet_count == 0 and server_topology:
-            loopback_hits = sum(
-                item["hit_count"]
-                for item in server_topology
-                if item.get("server_ip") in ("127.0.0.1", "::1", "localhost")
-            )
-            external_hits = sum(
-                item["hit_count"]
-                for item in server_topology
-                if item.get("server_ip") not in ("127.0.0.1", "::1", "localhost")
-            )
+            active_proxy_port = (
+                self._proxy_port_resolver() if self._proxy_port_resolver else None
+            ) or 8080
+
+            def _is_loopback_ip(ip: str | None) -> bool:
+                if not ip:
+                    return False
+                target = ip.strip().lower()
+                if target in ("127.0.0.1", "::1", "localhost"):
+                    return True
+                if target.startswith("127."):
+                    return True
+                try:
+                    return ipaddress.ip_address(target).is_loopback
+                except ValueError:
+                    return False
+
+            loopback_items = [
+                item for item in server_topology if _is_loopback_ip(item.get("server_ip"))
+            ]
+            external_items = [
+                item for item in server_topology if not _is_loopback_ip(item.get("server_ip"))
+            ]
+            loopback_hits = sum(item.get("hit_count", 0) for item in loopback_items)
+            external_hits = sum(item.get("hit_count", 0) for item in external_items)
+
             if loopback_hits > 0 and external_hits == 0:
-                proxy_ports = sorted(
-                    {
-                        item["port"]
-                        for item in server_topology
-                        if item.get("server_ip") in ("127.0.0.1", "::1", "localhost")
-                    }
+                all_loopback_ports = sorted(
+                    {int(item["port"]) for item in loopback_items if item.get("port")}
                 )
-                redirection_notice = {
-                    "is_redirected_to_proxy": True,
-                    "proxy_ports": proxy_ports,
-                    "loopback_hits": loopback_hits,
-                    "message": (
+                proxy_ports = [p for p in all_loopback_ports if p == active_proxy_port]
+                raw_socket_ports = [p for p in all_loopback_ports if p != active_proxy_port]
+                has_raw_socket = len(raw_socket_ports) > 0
+                is_redirected_to_proxy = len(proxy_ports) > 0 and not has_raw_socket
+
+                if has_raw_socket:
+                    msg = (
+                        f"检测到目标进程存在非 HTTP 原生套接字连接 (端口: {raw_socket_ports})，"
+                        f"未流经本地 HTTP 代理 (端口: {active_proxy_port})。原生 TCP 载荷未被捕获。"
+                        "建议使用 interface='loopback' 或 interface='auto' 进行底层重组。"
+                    )
+                else:
+                    msg = (
                         f"检测到目标进程活跃连接已被本地代理端口 ({proxy_ports}) 接管，"
                         "未流经物理网卡。全量明文数据已完整保存在 HTTP 抓包会话与 HAR 归档中。"
-                    ),
+                    )
+
+                redirection_notice = {
+                    "is_redirected_to_proxy": is_redirected_to_proxy,
+                    "has_raw_socket": has_raw_socket,
+                    "proxy_ports": proxy_ports,
+                    "raw_socket_ports": raw_socket_ports,
+                    "loopback_proxy_ports": proxy_ports,
+                    "loopback_hits": loopback_hits,
+                    "message": msg,
                 }
 
         # 5. 持久化伴随元数据 (CaptureSidecar)

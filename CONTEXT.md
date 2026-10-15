@@ -65,8 +65,16 @@ _Avoid_: PacketChunk (数据包块), SegmentSlice (段切片), MessageBlock (消
 _Avoid_: WsFrame (WS 帧), SocketMsg (套接字消息), PushEvent (推送事件)
 
 **ProxyRedirectionNotice (代理重定向感知通知)**:
-在双轨抓包环境下，系统检测到目标流量已被上层代理接管至本地环回而未经过物理网卡时生成的自解释拓扑诊断提示。
+在双轨抓包环境下，系统检测到目标流量已被上层 HTTP 代理端口完全接管且未流经物理网卡时生成的自解释拓扑诊断提示。
 _Avoid_: DropWarning (丢包警告), FilterAlert (过滤告警), RouteError (路由错误)
+
+**RawSocketTraffic (原生套接字流量)**:
+目标进程绕过系统 HTTP 协议栈、直接通过四层原始 TCP/UDP 套接字进行通信的网络流量；在存在本地代理软件重定向或混合应用场景下常流经回环网卡，无法被 HTTP 代理接管或记录。
+_Avoid_: HttpStream (HTTP 流), WebTraffic (网页流量)
+
+**MultiInterfaceCapture (多网卡协同捕获)**:
+通过底层抓包引擎同时监听物理网络适配器与回环适配器（如 Loopback）并按时序无损聚合入单一 PCAP 报文文件的捕获机制。
+_Avoid_: DualSniffer (双抓包器), InterfaceMerge (接口合并)
 
 **HarArchive (HAR 归档)**:
 遵循 HTTP Archive 1.2 规范的结构化归档文件，用于无损固化与外发交付完整抓包生命周期内的 HTTP 流及长连接帧记录。

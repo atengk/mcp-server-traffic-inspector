@@ -408,15 +408,28 @@ class NetworkDiagnostics:
         total_pkts = int(analysis.get("total_packets") or 0)
         if total_pkts == 0:
             if redirection_notice:
-                score = 100
-                health_status = "healthy"
-                summary = (
-                    "检测到目标进程流量已被本地 HTTP 代理接管（代理分流正常）。"
-                    "物理网卡切片无直接外联报文，全量明文数据已录制在 HTTP 会话中。"
-                )
-                recommendations.append(
-                    "若需捕获四层底层裸 TCP 二进制报文，请关闭全局代理后再启动抓包。"
-                )
+                if redirection_notice.get("has_raw_socket"):
+                    score = 60
+                    health_status = "degraded"
+                    raw_ports = redirection_notice.get("raw_socket_ports", [])
+                    summary = (
+                        f"检测到目标进程存在非 HTTP 原生套接字连接 (端口: {raw_ports})，"
+                        "未流经本地 HTTP 代理，原生 TCP 载荷未被记录。"
+                    )
+                    recommendations.append(
+                        "目标进程包含原生 TCP 套接字通信，请使用 "
+                        "interface='loopback' 或 interface='auto' 重新执行网络层抓包。"
+                    )
+                else:
+                    score = 100
+                    health_status = "healthy"
+                    summary = (
+                        "检测到目标进程流量已被本地 HTTP 代理接管（代理分流正常）。"
+                        "物理网卡切片无直接外联报文，全量明文数据已录制在 HTTP 会话中。"
+                    )
+                    recommendations.append(
+                        "若需捕获四层底层裸 TCP 二进制报文，请关闭全局代理后再启动抓包。"
+                    )
             else:
                 score = 50
                 health_status = "degraded"

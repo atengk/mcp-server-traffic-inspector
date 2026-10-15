@@ -402,7 +402,7 @@ def _register_pcap_tools(
 
     @mcp.tool()
     def start_pcap_capture(
-        interface: int | str = 1,
+        interface: int | str | list[int | str] = 1,
         output_path: str | None = None,
         bpf_filter: str | None = None,
         max_packets: int = 2000,
@@ -416,7 +416,7 @@ def _register_pcap_tools(
         """在指定网卡启动原始网络层数据包捕获 (PcapCapture)，支持进程树过滤与多服务器拓扑审计。
 
         Args:
-            interface: 网卡索引或名称，默认 1。
+            interface: 网卡索引、名称、'loopback'、'auto' 或网卡标识符列表，默认 1。
             output_path: 保存目标 .pcap 文件绝对路径；为空时自动生成。
             bpf_filter: 可选的 Berkeley Packet Filter 表达式（如 'tcp and port 443'）。
             max_packets: 最大抓包数熔断上限，默认 2000 包。
@@ -663,6 +663,7 @@ def create_mcp_server(
     manager = capture_manager or HttpCaptureManager(storage=bus)
     replayer = replay_engine or FlowReplayEngine(storage=bus)
     pcap_mgr = pcap_manager or PcapCaptureManager(tshark_path=config.tshark_path)
+    pcap_mgr.set_proxy_port_resolver(lambda: getattr(manager, "_port", None) or 8080)
     diag_engine = diagnostics or NetworkDiagnostics(storage=bus, pcap_manager=pcap_mgr)
     sys_proxy = system_proxy or SystemProxyManager()
     har_exp = har_exporter or HarExporter(storage=bus)

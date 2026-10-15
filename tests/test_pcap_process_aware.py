@@ -269,3 +269,151 @@ def test_process_aware_capture_detects_proxy_redirection_and_diagnoses_health(
     assert diag_res["sidecar_loaded"] is True
     assert "代理分流正常" in diag_res["summary"]
     assert "redirection_notice" in diag_res
+
+
+def test_pcap_raw_socket_loopback_redirection_and_diagnostics(tmp_path: Path) -> None:
+    """验证目标进程走原生 TCP 套接字回环连接时的精准分流感知与 60 分降级诊断。"""
+    fake_tshark = tmp_path / "fake_tshark.exe"
+    fake_tshark.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    captured_cmds: list[list[str]] = []
+
+    def spawner(cmd: list[str], env: dict[str, str]) -> MockWorkerProcess:
+        captured_cmds.append(cmd)
+        return MockWorkerProcess(cmd, env)
+
+    def runner(cmd: list[str]) -> str:
+        if "-w" in cmd:
+            target_idx = cmd.index("-w") + 1
+            Path(cmd[target_idx]).write_bytes(b"EMPTY_SLICE_PCAP")
+        if "frame.number" in cmd:
+            return ""
+        if "-r" in cmd and "fields" in cmd:
+            return ""
+        return ""
+
+    def mock_snapshots() -> list[ProcessInfo]:
+        return [
+            ProcessInfo(
+                pid=3000,
+                ppid=1,
+                name="GameClient.exe",
+                exe_path="C:\\Games\\GameClient.exe",
+            ),
+        ]
+
+    # 模拟目标进程连接到 127.0.0.1:8000 和 127.0.0.2:843 (非受管 HTTP 代理端口 8080)
+    def mock_sockets() -> list[SocketEntry]:
+        return [
+            SocketEntry(
+                proto="TCP",
+                local_ip="127.0.0.1",
+                local_port=61234,
+                remote_ip="127.0.0.1",
+                remote_port=8000,
+                pid=3000,
+            ),
+            SocketEntry(
+                proto="TCP",
+                local_ip="127.0.0.1",
+                local_port=61235,
+                remote_ip="127.0.0.2",
+                remote_port=843,
+                pid=3000,
+            ),
+        ]
+
+    manager = PcapCaptureManager(
+        tshark_path=str(fake_tshark),
+        command_runner=runner,
+        process_spawner=spawner,
+        default_output_dir=tmp_path,
+        snapshot_fetcher=mock_snapshots,
+        socket_fetcher=mock_sockets,
+    )
+    manager.set_proxy_port_resolver(lambda: 8080)
+
+    start_res = manager.start_capture(
+        process_name="GameClient.exe",
+        output_path=str(tmp_path / "game_target.pcap"),
+    )
+    raw_pcap_file = Path(start_res["output_file"])
+    raw_pcap_file.write_bytes(b"RAW_PCAP_BYTES")
+
+    stop_res = manager.stop_capture()
+
+    assert stop_res["status"] == "stopped"
+    assert stop_res["packet_count"] == 0
+    assert "redirection_notice" in stop_res
+    notice = stop_res["redirection_notice"]
+    assert notice["is_redirected_to_proxy"] is False
+    assert notice["has_raw_socket"] is True
+    assert notice["raw_socket_ports"] == [843, 8000]
+    assert "原生套接字" in notice["message"]
+
+    # 验证诊断引擎识别到 raw_socket，降级为 60 分 (degraded)
+    bus = StorageBus(tmp_path / "game.db", tmp_path / "game_blobs", preserve_db=False)
+    bus.initialize()
+    diag = NetworkDiagnostics(storage=bus, pcap_manager=manager)
+    diag_res = diag.diagnose_pcap_session(file_path=stop_res["pcap_file"])
+    assert diag_res["health_status"] == "degraded"
+    assert diag_res["health_score"] == 60
+    assert "原生套接字" in diag_res["summary"]
+    assert any("loopback" in rec for rec in diag_res["recommendations"])
+
+
+def test_pcap_interface_resolution_and_multi_interface_capture(tmp_path: Path) -> None:
+    """验证 'loopback' 别名解析、'auto' 双轨网卡推导与多网卡合并传参。"""
+    fake_tshark = tmp_path / "fake_tshark.exe"
+    fake_tshark.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    captured_cmds: list[list[str]] = []
+
+    def spawner(cmd: list[str], env: dict[str, str]) -> MockWorkerProcess:
+        captured_cmds.append(cmd)
+        return MockWorkerProcess(cmd, env)
+
+    def runner(cmd: list[str]) -> str:
+        if "-D" in cmd:
+            return (
+                "1. \\Device\\NPF_{WLAN_GUID} (WLAN)\n"
+                "2. \\Device\\NPF_Loopback (Adapter for loopback traffic capture)\n"
+                "3. etwdump (Event Tracing for Windows)\n"
+            )
+        return ""
+
+    manager = PcapCaptureManager(
+        tshark_path=str(fake_tshark),
+        command_runner=runner,
+        process_spawner=spawner,
+        default_output_dir=tmp_path,
+    )
+
+    # 1. 验证 loopback 语义别名
+    loop_resolved = manager._normalize_interface("loopback")
+    assert loop_resolved == "\\Device\\NPF_Loopback"
+
+    # 2. 验证 auto 双轨自适应
+    auto_resolved = manager._resolve_interfaces("auto")
+    assert "\\Device\\NPF_{WLAN_GUID}" in auto_resolved
+    assert "\\Device\\NPF_Loopback" in auto_resolved
+
+    # 3. 验证网卡列表解析
+    list_resolved = manager._resolve_interfaces(["WLAN", "loopback"])
+    assert list_resolved == ["\\Device\\NPF_{WLAN_GUID}", "\\Device\\NPF_Loopback"]
+
+    # 4. 验证 start_capture 产生多 -i 参数
+    start_res = manager.start_capture(
+        interface="auto",
+        output_path=str(tmp_path / "auto_capture.pcap"),
+    )
+    assert start_res["status"] == "capturing"
+    assert len(start_res["resolved_interfaces"]) == 2
+
+    last_cmd = captured_cmds[-1]
+    i_indices = [idx for idx, val in enumerate(last_cmd) if val == "-i"]
+    assert len(i_indices) == 2
+    assert last_cmd[i_indices[0] + 1] == "\\Device\\NPF_{WLAN_GUID}"
+    assert last_cmd[i_indices[1] + 1] == "\\Device\\NPF_Loopback"
+
+    manager.stop_capture()
