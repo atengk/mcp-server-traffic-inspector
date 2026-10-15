@@ -4,7 +4,7 @@
 # 内置 Python 3.12、uv、mitmproxy 与 tshark，默认以 SSE 模式暴露 MCP 服务与抓包代理端口。
 # ==============================================================================
 
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
