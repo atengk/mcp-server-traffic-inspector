@@ -315,6 +315,131 @@ def _check_ca_certificate() -> ComponentCheckResult:
     )
 
 
+def get_ca_env_vars() -> dict[str, str]:
+    """获取适配常见运行时（Python、Node.js、curl、git）的 CA 证书环境变量字典。"""
+    confdir = Path.home() / ".mitmproxy"
+    pem_cert = confdir / "mitmproxy-ca-cert.pem"
+    cer_cert = confdir / "mitmproxy-ca-cert.cer"
+    target = pem_cert if pem_cert.is_file() else (cer_cert if cer_cert.is_file() else None)
+    if target is None:
+        return {}
+    target_str = str(target.resolve())
+    return {
+        "SSL_CERT_FILE": target_str,
+        "REQUESTS_CA_BUNDLE": target_str,
+        "NODE_EXTRA_CA_CERTS": target_str,
+        "CURL_CA_BUNDLE": target_str,
+        "GIT_SSL_CAINFO": target_str,
+    }
+
+
+def trust_ca_certificate(system_wide: bool = False) -> dict[str, Any]:
+    """将 mitmproxy CA 证书安装至操作系统受信任根证书库，并生成环境变量配置。
+
+    Args:
+        system_wide: Windows 下是否强制写入系统全局库（需要管理员权限），
+            默认 False（当前用户根证书库，免提权）。
+
+    Returns:
+        包含 status、message、scope、cert_path 与 env_vars 的字典。
+    """
+    confdir = Path.home() / ".mitmproxy"
+    pem_cert = confdir / "mitmproxy-ca-cert.pem"
+    cer_cert = confdir / "mitmproxy-ca-cert.cer"
+    target = cer_cert if cer_cert.is_file() else (pem_cert if pem_cert.is_file() else None)
+    env_vars = get_ca_env_vars()
+
+    if target is None:
+        return {
+            "status": "error",
+            "message": "未找到已生成的 mitmproxy CA 证书文件，请先启动一次 HTTP 抓包自动生成证书。",
+            "env_vars": env_vars,
+        }
+
+    target_str = str(target.resolve())
+    if sys.platform == "win32":
+        scope = "LocalMachine" if system_wide else "CurrentUser"
+        cmd = (
+            ["certutil", "-addstore", "-f", "Root", target_str]
+            if system_wide
+            else ["certutil", "-user", "-addstore", "Root", target_str]
+        )
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15.0,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return {
+                    "status": "ok",
+                    "scope": scope,
+                    "cert_path": target_str,
+                    "message": f"成功将 CA 证书导入 Windows {scope} 受信任根证书颁发机构。",
+                    "env_vars": env_vars,
+                }
+            return {
+                "status": "error",
+                "scope": scope,
+                "cert_path": target_str,
+                "message": f"certutil 导入证书失败: {completed.stderr or completed.stdout}",
+                "env_vars": env_vars,
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "scope": scope,
+                "cert_path": target_str,
+                "message": f"执行 certutil 命令异常: {exc}",
+                "env_vars": env_vars,
+            }
+
+    if sys.platform == "darwin":
+        cmd = [
+            "security",
+            "add-trusted-cert",
+            "-d",
+            "-r",
+            "trustRoot",
+            "-k",
+            str(Path.home() / "Library/Keychains/login.keychain-db"),
+            target_str,
+        ]
+        try:
+            completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            status = "ok" if completed.returncode == 0 else "error"
+            return {
+                "status": status,
+                "scope": "login.keychain",
+                "cert_path": target_str,
+                "message": "macOS 钥匙串导入完毕" if status == "ok" else completed.stderr,
+                "env_vars": env_vars,
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "cert_path": target_str,
+                "message": f"macOS security 导入异常: {exc}",
+                "env_vars": env_vars,
+            }
+
+    # Linux 平台引导
+    return {
+        "status": "manual_action_required",
+        "scope": "system",
+        "cert_path": target_str,
+        "message": (
+            f"Linux 请执行: sudo cp '{target_str}' "
+            "/usr/local/share/ca-certificates/mitmproxy.crt && sudo update-ca-certificates"
+        ),
+        "env_vars": env_vars,
+    }
+
+
 def _check_sqlite_wal(
     config: ServerConfig,
     storage: StorageBus | None = None,

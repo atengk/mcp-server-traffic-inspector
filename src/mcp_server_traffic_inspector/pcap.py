@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import gzip
 import ipaddress
 import logging
 import os
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -294,6 +296,106 @@ def parse_tcp_streams_output(
     return sorted_streams[: max(1, int(limit))]
 
 
+def _extract_tls_sni(data: bytes) -> str | None:
+    """从 TLS Client Hello 握手数据中提取 SNI (Server Name Indication) 域名。"""
+    try:
+        if len(data) < 44 or data[0] != 0x16 or data[5] != 0x01:
+            return None
+        pos = 43
+        session_id_len = data[pos]
+        pos += 1 + session_id_len
+        if pos + 2 > len(data):
+            return None
+        cipher_len = int.from_bytes(data[pos : pos + 2], "big")
+        pos += 2 + cipher_len
+        if pos + 1 > len(data):
+            return None
+        comp_len = data[pos]
+        pos += 1 + comp_len
+        if pos + 2 > len(data):
+            return None
+        ext_total_len = int.from_bytes(data[pos : pos + 2], "big")
+        pos += 2
+        ext_end = min(pos + ext_total_len, len(data))
+        while pos + 4 <= ext_end:
+            ext_type = int.from_bytes(data[pos : pos + 2], "big")
+            ext_len = int.from_bytes(data[pos + 2 : pos + 4], "big")
+            pos += 4
+            if ext_type == 0:  # server_name
+                sub_pos = pos
+                if sub_pos + 2 <= ext_end:
+                    sub_pos += 2  # skip server_name_list_len
+                    while sub_pos + 3 <= pos + ext_len and sub_pos + 3 <= ext_end:
+                        name_type = data[sub_pos]
+                        name_len = int.from_bytes(data[sub_pos + 1 : sub_pos + 3], "big")
+                        sub_pos += 3
+                        if name_type == 0 and sub_pos + name_len <= ext_end:
+                            return data[sub_pos : sub_pos + name_len].decode(
+                                "utf-8", errors="replace"
+                            )
+                        sub_pos += name_len
+            pos += ext_len
+    except Exception:
+        return None
+    return None
+
+
+def _heuristic_dissect_payload(data: bytes) -> dict[str, Any]:
+    """对原始二进制 payload 执行启发式协议推断与轻量解构。"""
+    res: dict[str, Any] = {}
+    if not data:
+        return res
+
+    # 1. 协议特征识别 (TLS / HTTP / WebSocket)
+    if data.startswith(b"\x16\x03"):
+        res["protocol_hint"] = "TLS"
+        sni = _extract_tls_sni(data)
+        if sni:
+            res["tls_sni"] = sni
+    elif any(
+        data.startswith(m)
+        for m in (
+            b"GET ",
+            b"POST ",
+            b"PUT ",
+            b"DELETE ",
+            b"PATCH ",
+            b"HEAD ",
+            b"OPTIONS ",
+            b"CONNECT ",
+            b"HTTP/1.",
+            b"HTTP/2.",
+        )
+    ):
+        res["protocol_hint"] = "HTTP"
+        if b"Upgrade: websocket" in data or b"upgrade: websocket" in data:
+            res["protocol_hint"] = "WebSocket Handshake"
+    elif data[0] in (0x81, 0x82, 0x88, 0x89, 0x8A) and len(data) >= 2:
+        # WebSocket 常见帧头特征 (FIN + Text/Binary/Close/Ping/Pong)
+        res["protocol_hint"] = "WebSocket Frame"
+
+    # 2. 压缩流解构尝试 (Gzip / Zlib)
+    try:
+        decomp = None
+        if data.startswith(b"\x1f\x8b"):
+            decomp = gzip.decompress(data[:65536])
+        elif len(data) >= 2 and data[:2] in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
+            decomp = zlib.decompress(data[:65536])
+        if decomp:
+            res["decompressed_preview"] = decomp[:300].decode("utf-8", errors="replace")
+    except Exception:
+        pass
+
+    # 3. 提取可打印 ASCII 字符串片段 (类似 strings 命令)
+    ascii_strings = [
+        s.decode("ascii", errors="ignore") for s in re.findall(rb"[\x20-\x7e]{4,}", data[:2048])
+    ]
+    if ascii_strings:
+        res["heuristic_strings"] = ascii_strings[:10]
+
+    return res
+
+
 def parse_tcp_stream_turns_output(
     tsv_lines: Sequence[str],
     stream_id: int,
@@ -409,6 +511,9 @@ def parse_tcp_stream_turns_output(
             "payload_preview": text_payload,
             "truncated": truncated,
         }
+        heuristic = _heuristic_dissect_payload(b_data)
+        if heuristic:
+            turn_obj["heuristic"] = heuristic
         if format == "hex":
             turn_obj["payload_hex"] = b_data.hex()
         elif format == "raw" and not is_binary:

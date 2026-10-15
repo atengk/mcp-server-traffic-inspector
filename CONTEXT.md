@@ -84,3 +84,15 @@ _Avoid_: TrafficExport (流量导出), HttpDump (HTTP 转储), SessionLog (会�
 在抓包启停阶段自动协同证书托管、代理环境接管、智能权属安全复位与 HAR 归档导出的端到端受控闭环。
 _Avoid_: AutoPilot (自动驾驶), SilentMode (静默模式), ProxyDaemon (代理守护进程)
 
+**SupervisedLaunch (受管进程拉起)**:
+由主控服务主动创建并托管的被测目标进程，在第 0 毫秒原子级注入代理网络参数与非系统运行时 CA 环境变量，并实时绑定 PID 树时空切片进行双轨抓包。
+_Avoid_: ForkProcess (分叉进程), BackgroundTask (后台任务), SpawnRunner (启动运行器)
+
+**ChaosInjection (混沌故障注入)**:
+基于动态拦截引擎在 HTTP 请求流或响应流前置注入人为延迟 (Delay)、模拟物理连接异常瞬断 (Abort) 或设定有限触发次数 (MaxHits) 的网络韧性评测机制。
+_Avoid_: NetworkJitter (网络抖动), ErrorMock (错误模拟), TrafficShaping (流量整形)
+
+**HeuristicDissector (启发式协议嗅探)**:
+在缺乏完整协议解码器或加密四层流场景下，通过特征魔数、TLS SNI 解析、帧头特征、数据流尝试解压缩与可打印字符提炼，自适应推断通信协议与交互意图的轻量分析器。
+_Avoid_: DeepInspector (深度检测器), ProtocolGuess (协议猜测), RawScanner (原始扫描器)
+

@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import shlex
+import subprocess
 import tempfile
 import time
 from collections.abc import Callable
@@ -18,6 +21,12 @@ from mcp.server.fastmcp import FastMCP
 from mcp_server_traffic_inspector.capture_manager import HttpCaptureManager
 from mcp_server_traffic_inspector.config import LOGGER_NAME, ServerConfig
 from mcp_server_traffic_inspector.diagnostics import NetworkDiagnostics
+from mcp_server_traffic_inspector.doctor import (
+    get_ca_env_vars,
+)
+from mcp_server_traffic_inspector.doctor import (
+    trust_ca_certificate as do_trust_ca,
+)
 from mcp_server_traffic_inspector.har_exporter import HarExporter
 from mcp_server_traffic_inspector.pcap import PcapCaptureManager
 from mcp_server_traffic_inspector.replay import FlowReplayEngine
@@ -182,38 +191,44 @@ def _register_http_tools(
         offset: int = 0,
         session_id: str | None = None,
         host: str | None = None,
+        query: str | None = None,
         status_code: int | None = None,
         status_family: str | None = None,
         method: str | None = None,
         min_duration_ms: float | None = None,
         sort_by: str = "timestamp",
+        compact: bool = False,
     ) -> dict[str, Any]:
-        """按多维条件分页检索已捕获的 HttpFlow 轻量元数据列表（不含 BodyPayload）。
+        """按多维条件分页检索已捕获的 HttpFlow 轻量元数据列表（支持全文模糊过滤与紧凑模式）。
 
         Args:
             limit: 单页返回最大条数，默认 20。
             offset: 分页起始偏移量，默认 0。
             session_id: 可选抓包会话 ID；未指定时检索全部已录制会话。
             host: 按目标域名子串过滤（不区分大小写）。
+            query: 按 URL 路径、完整地址或主机名进行模糊匹配，提升检索效率。
             status_code: 按精确 HTTP 状态码过滤。
             status_family: 按状态码族过滤（可选: 2xx, 3xx, 4xx, 5xx, error）。
             method: 按 HTTP 方法过滤（如 GET、POST）。
             min_duration_ms: 按最小请求耗时（毫秒）过滤慢请求。
             sort_by: 排序字段（timestamp、duration_ms、size）。
+            compact: 是否开启紧凑模式（仅保留核心调试字段，节约 Token），默认 False。
 
         Returns:
-            包含 total、session_id 与 flows 列表的字典；无匹配数据时 flows 返回 []。
+            包含 total、summary_metrics、session_id 与 flows 的字典；无匹配时 flows 为 []。
         """
         return storage.list_http_flows(
             limit=limit,
             offset=offset,
             session_id=session_id,
             host=host,
+            query=query,
             status_code=status_code,
             status_family=status_family,
             method=method,
             min_duration_ms=min_duration_ms,
             sort_by=sort_by,
+            compact=compact,
         )
 
     @mcp.tool()
@@ -290,20 +305,25 @@ def _register_manipulation_tools(
         mock_body: str | dict[str, Any] | list[Any] | None = None,
         modify_request_headers: dict[str, str] | None = None,
         modify_response_headers: dict[str, str] | None = None,
+        delay_ms: int = 0,
+        max_hits: int | None = None,
     ) -> dict[str, Any]:
-        """新增一条非阻塞动态拦截规则 (InterceptRule)，支持 Mock 短路返回与 Header 动态改写。
+        """新增一条非阻塞动态拦截规则 (InterceptRule)，支持 Mock、Header 改写、延迟与混沌故障注入。
 
         Args:
             url_pattern: 目标 URL 匹配模式（支持正则、通配符或子串）。
-            action: 规则动作，可选 'mock' 或 'modify'，默认 'mock'。
+            action: 规则动作，可选 'mock'、'modify'、'delay' 或 'abort'（模拟连接异常断开），
+                默认 'mock'。
             mock_status: 当 action='mock' 时返回的状态码，默认 200。
             mock_headers: 当 action='mock' 时返回的自定义响应头。
             mock_body: 当 action='mock' 时返回的响应正文。
             modify_request_headers: 转发前注入或改写的请求头。
             modify_response_headers: 返回前注入或改写的响应头。
+            delay_ms: 注入的响应前置延迟（毫秒），用于仿真慢接口或超时边界，默认 0。
+            max_hits: 最大触发次数上限；达到指定命中次数后规则自动安全失活（None 表示持续有效）。
 
         Returns:
-            包含 rule_id、action、url_pattern 与 status ("active") 的字典。
+            包含 rule_id、action、url_pattern、delay_ms、max_hits 与 status ("active") 的字典。
         """
         return storage.add_intercept_rule(
             url_pattern=url_pattern,
@@ -313,6 +333,8 @@ def _register_manipulation_tools(
             mock_body=mock_body,
             modify_request_headers=modify_request_headers,
             modify_response_headers=modify_response_headers,
+            delay_ms=delay_ms,
+            max_hits=max_hits,
         )
 
     @mcp.tool()
@@ -559,6 +581,23 @@ def _register_ops_tools(
     """注册 CA 证书指引、跨平台系统代理托管与 HAR 会话归档导出工具集。"""
 
     @mcp.tool()
+    def trust_ca_certificate(
+        system_wide: bool = False,
+    ) -> dict[str, Any]:
+        """将 mitmproxy CA 根证书导入系统信任库并提供常见运行时环境变量字典。
+
+        在 Windows 默认免 UAC 提权注入当前用户证书库 (CurrentUser\\Root)；
+        自动生成 NODE_EXTRA_CA_CERTS、SSL_CERT_FILE、REQUESTS_CA_BUNDLE 等环境配置。
+
+        Args:
+            system_wide: 是否尝试安装至系统级受信任根证书库（需要管理员权限），默认 False。
+
+        Returns:
+            包含 status、ca_cert_path、platform、system_wide、env_vars 及 details 的字典。
+        """
+        return do_trust_ca(system_wide=system_wide)
+
+    @mcp.tool()
     def get_ca_certificate(
         install_to_system: bool = False,
     ) -> dict[str, Any]:
@@ -630,6 +669,147 @@ def _register_ops_tools(
         )
 
 
+def _register_process_tools(
+    mcp: FastMCP,
+    capture_manager: HttpCaptureManager,
+    pcap_manager: PcapCaptureManager,
+    lifecycle: LifecycleManager | None = None,
+) -> None:
+    """注册进程主动受管拉起、环境变量自动注入与双轨时空切片抓包工具集。"""
+
+    @mcp.tool()
+    def launch_and_inspect_process(
+        command: list[str] | str,
+        cwd: str | None = None,
+        extra_env: dict[str, str] | None = None,
+        inject_proxy: bool = True,
+        inject_ca_cert: bool = True,
+        capture_pcap: bool = False,
+        pcap_interface: int | str = "loopback",
+        wait_for_exit: bool = False,
+        timeout_seconds: int = 30,
+    ) -> dict[str, Any]:
+        """主动拉起受管目标进程，原子级注入抓包代理与 CA 环境变量，并支持第 0 毫秒双轨抓包。
+
+        解决短生命周期 CLI/脚本启动阶段漏包与非系统信任库（Node/Python/Go/Curl）证书错误痛点。
+
+        Args:
+            command: 待执行的命令行参数列表（如 ['python', 'script.py']）或命令行字符串。
+            cwd: 进程执行的工作目录绝对路径；为空时继承当前工作目录。
+            extra_env: 可选的自定义补充环境变量字典。
+            inject_proxy: 是否自动将 HTTP_PROXY 等代理变量注入到子进程，默认 True。
+            inject_ca_cert: 是否自动注入 Node/Python 等运行时的 CA 证书环境变量，默认 True。
+            capture_pcap: 是否同步联动网络层 PCAP 抓包进行双轨捕获，默认 False。
+            pcap_interface: 当 capture_pcap=True 时的网卡选择，默认 'loopback'。
+            wait_for_exit: 是否同步等待目标进程执行退出并收集 stdout/stderr，默认 False。
+            timeout_seconds: 当 wait_for_exit=True 时等待进程退出的最大超时秒数，默认 30。
+
+        Returns:
+            包含 status、pid、exit_code、stdout、stderr 与抓包信息的字典。
+        """
+        # 1. 解析命令参数
+        if isinstance(command, str):
+            cmd_args = (
+                shlex.split(command, posix=False) if os.name == "nt" else shlex.split(command)
+            )
+        else:
+            cmd_args = list(command)
+
+        if not cmd_args:
+            raise ValueError("启动命令行 command 不能为空")
+
+        # 2. 组装环境变量
+        env = os.environ.copy()
+        injected_proxy_port: int | None = None
+        if inject_proxy:
+            proxy_port = getattr(capture_manager, "_port", None) or 8080
+            injected_proxy_port = proxy_port
+            proxy_url = f"http://127.0.0.1:{proxy_port}"
+            for k in (
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ):
+                env[k] = proxy_url
+
+        if inject_ca_cert:
+            ca_envs = get_ca_env_vars()
+            env.update(ca_envs)
+
+        if extra_env:
+            env.update(extra_env)
+
+        # 3. 启动受管子进程
+        proc = subprocess.Popen(
+            cmd_args,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE if wait_for_exit else None,
+            stderr=subprocess.PIPE if wait_for_exit else None,
+            text=True if wait_for_exit else False,
+        )
+        pid = proc.pid
+        if lifecycle is not None:
+            lifecycle.register(lambda: proc.kill() if proc.poll() is None else None)
+
+        # 4. 联动网卡抓包 (第 0 毫秒绑定 PID 树)
+        pcap_start_res = None
+        if capture_pcap:
+            try:
+                pcap_start_res = pcap_manager.start_capture(
+                    interface=pcap_interface,
+                    target_pids=[pid],
+                    include_child_processes=True,
+                )
+            except Exception as exc:
+                logger.warning("受管进程联动启动 PCAP 抓包失败: %s", exc)
+                pcap_start_res = {"error": str(exc)}
+
+        # 5. 等待退出或立即返回
+        if not wait_for_exit:
+            return {
+                "status": "running",
+                "pid": pid,
+                "command": cmd_args,
+                "proxy_port_injected": injected_proxy_port,
+                "ca_injected": inject_ca_cert,
+                "pcap_capture": pcap_start_res,
+            }
+
+        timed_out = False
+        try:
+            out, err = proc.communicate(timeout=timeout_seconds)
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            exit_code = -1
+            timed_out = True
+
+        pcap_stop_res = None
+        if capture_pcap and getattr(pcap_manager, "_current_session", None):
+            try:
+                pcap_stop_res = pcap_manager.stop_capture()
+            except Exception as exc:
+                logger.warning("受管进程退出停止 PCAP 抓包异常: %s", exc)
+                pcap_stop_res = {"error": str(exc)}
+
+        return {
+            "status": "completed",
+            "pid": pid,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "stdout": (out or "")[:4096],
+            "stderr": (err or "")[:4096],
+            "proxy_port_injected": injected_proxy_port,
+            "ca_injected": inject_ca_cert,
+            "pcap_capture": pcap_stop_res or pcap_start_res,
+        }
+
+
 def create_mcp_server(
     config: ServerConfig,
     storage: StorageBus | None = None,
@@ -655,7 +835,7 @@ def create_mcp_server(
         lifecycle: 可选的生命周期管理器；传入时自动注册子进程与代理状态停止钩子。
 
     Returns:
-        完成全部 23 个工具注册的 FastMCP 服务对象。
+        完成全部 25 个工具注册的 FastMCP 服务对象。
     """
     # 1. 初始化共享 SQLite WAL 数据总线与核心业务管理器
     bus = storage or StorageBus.from_config(config)
@@ -673,7 +853,7 @@ def create_mcp_server(
         lifecycle.register(lambda: None if pcap_mgr.stop_capture() else None)
         lifecycle.register(lambda: sys_proxy.restore_initial_state())
 
-    # 2. 创建 FastMCP 主控实例并注册各领域工具集 (23 个 Tools)
+    # 2. 创建 FastMCP 主控实例并注册各领域工具集 (25 个 Tools)
     mcp = FastMCP(
         name=SERVER_NAME,
         instructions=SERVER_INSTRUCTIONS,
@@ -692,4 +872,10 @@ def create_mcp_server(
     _register_pcap_tools(mcp=mcp, pcap_manager=pcap_mgr)
     _register_diagnostic_tools(mcp=mcp, diagnostics=diag_engine)
     _register_ops_tools(mcp=mcp, system_proxy=sys_proxy, har_exporter=har_exp)
+    _register_process_tools(
+        mcp=mcp,
+        capture_manager=manager,
+        pcap_manager=pcap_mgr,
+        lifecycle=lifecycle,
+    )
     return mcp

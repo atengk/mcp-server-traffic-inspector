@@ -201,8 +201,27 @@ class TrafficCaptureAddon:
         if not matched_rules:
             return
 
-        # 2. 按序应用请求头改写或触发 Mock 响应直接短路返回
+        # 2. 按序应用请求头改写、延迟注入或触发 Mock/Abort
         for rule in matched_rules:
+            rule_id = rule.get("id")
+            # 1. 延迟注入仿真
+            delay_ms = int(rule.get("delay_ms") or 0)
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
+
+            # 2. 统计命中并触发原子递增
+            if rule_id:
+                try:
+                    self.storage.increment_rule_hit(rule_id)
+                except Exception as exc:
+                    logger.debug("累加规则命中计数失败: %s", exc)
+
+            # 3. 故障模拟：主动强制切断连接 (abort)
+            if rule.get("action") == "abort":
+                if hasattr(flow, "kill"):
+                    flow.kill()
+                return
+
             req_mods = rule.get("modify_request_headers") or {}
             if req_mods:
                 _apply_headers_mutation(req, req_mods)
@@ -217,6 +236,7 @@ class TrafficCaptureAddon:
                     content=body_bytes,
                     headers=headers_dict,
                 )
+                return
 
     def _persist_flow(self, flow: Any, has_error: bool = False) -> None:
         req = getattr(flow, "request", None)

@@ -87,6 +87,9 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     mock_body TEXT,
     modify_request_headers TEXT,
     modify_response_headers TEXT,
+    delay_ms INTEGER DEFAULT 0,
+    max_hits INTEGER,
+    hit_count INTEGER DEFAULT 0,
     created_at REAL NOT NULL
 );
 
@@ -243,6 +246,15 @@ class StorageBus:
         # 2. 连接 SQLite 并开启 WAL 与外键约束，执行核心 DDL
         with closing(self._connect()) as conn:
             conn.executescript(SCHEMA_DDL)
+            for col_def in [
+                "delay_ms INTEGER DEFAULT 0",
+                "max_hits INTEGER",
+                "hit_count INTEGER DEFAULT 0",
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE intercept_rules ADD COLUMN {col_def};")
+                except Exception:
+                    pass
             conn.commit()
 
     def _prepare_body_storage(
@@ -415,6 +427,8 @@ class StorageBus:
         status_family: str | None = None,
         method: str | None = None,
         min_duration_ms: float | None = None,
+        query: str | None = None,
+        compact: bool = False,
         sort_by: str = "timestamp",
     ) -> dict[str, Any]:
         """按多维过滤条件分页查询轻量级 HttpFlow 列表（不含任何 Body 内容）。
@@ -428,10 +442,13 @@ class StorageBus:
             status_family: 按状态码族（2xx、3xx、4xx、5xx、error）过滤。
             method: 按 HTTP 请求方法过滤（不区分大小写）。
             min_duration_ms: 按最小请求耗时（毫秒）过滤。
+            query: 可选的 URL 路径与域名模糊搜索关键词。
+            compact: 是否返回极简紧凑视图（大幅节约 Token）。
             sort_by: 排序字段（timestamp、duration_ms、size）。
 
         Returns:
-            包含 total、session_id 与 flows 列表的字典；无匹配数据时 flows 固定为 []。
+            包含 total、session_id、summary_metrics 与 flows 列表的字典；
+            无匹配数据时 flows 固定为 []。
         """
         # 1. 组装参数化 WHERE 子句
         clauses: list[str] = []
@@ -460,6 +477,10 @@ class StorageBus:
         if min_duration_ms is not None:
             clauses.append("duration_ms >= ?")
             params.append(float(min_duration_ms))
+        if query and query.strip():
+            q_term = f"%{query.strip().lower()}%"
+            clauses.append("(LOWER(path) LIKE ? OR LOWER(host) LIKE ?)")
+            params.extend([q_term, q_term])
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -471,13 +492,28 @@ class StorageBus:
         }
         order_sql = sort_map.get(sort_by.strip().lower(), "timestamp DESC")
 
-        # 3. 执行总数统计与分页元数据查询
+        # 3. 执行总数统计、聚合指标与分页查询
         with closing(self._connect()) as conn:
-            total_row = conn.execute(
-                f"SELECT COUNT(*) FROM http_flows {where_sql};",
+            metrics_row = conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) as total_count,
+                    SUM(
+                        CASE WHEN (has_error = 1 OR status_code >= 400) THEN 1 ELSE 0 END
+                    ) as error_count,
+                    AVG(duration_ms) as avg_duration
+                FROM http_flows
+                {where_sql};
+                """,
                 params,
             ).fetchone()
-            total = int(total_row[0]) if total_row else 0
+            total = int(metrics_row["total_count"] or 0) if metrics_row else 0
+            error_count = int(metrics_row["error_count"] or 0) if metrics_row else 0
+            avg_duration = (
+                round(float(metrics_row["avg_duration"]), 2)
+                if (metrics_row and metrics_row["avg_duration"] is not None)
+                else 0.0
+            )
 
             rows = conn.execute(
                 f"""
@@ -495,32 +531,49 @@ class StorageBus:
 
         flows: list[dict[str, Any]] = []
         for row in rows:
-            flows.append(
-                {
-                    "id": str(row["id"]),
-                    "session_id": str(row["session_id"]),
-                    "time": _format_iso_time(float(row["timestamp"])),
-                    "method": str(row["method"]),
-                    "url": _format_url(
-                        str(row["scheme"]),
-                        str(row["host"]),
-                        int(row["port"]),
-                        str(row["path"]),
-                    ),
-                    "status_code": int(row["status_code"])
-                    if row["status_code"] is not None
-                    else None,
-                    "duration_ms": float(row["duration_ms"])
-                    if row["duration_ms"] is not None
-                    else None,
-                    "content_type": row["response_content_type"] or row["request_content_type"],
-                    "size": int(row["response_body_size"] or 0),
-                }
+            url_str = _format_url(
+                str(row["scheme"]),
+                str(row["host"]),
+                int(row["port"]),
+                str(row["path"]),
             )
+            sc = int(row["status_code"]) if row["status_code"] is not None else None
+            dur = float(row["duration_ms"]) if row["duration_ms"] is not None else None
+            ct = row["response_content_type"] or row["request_content_type"]
+
+            if compact:
+                flows.append(
+                    {
+                        "id": str(row["id"]),
+                        "method": str(row["method"]),
+                        "url": url_str,
+                        "status_code": sc,
+                        "duration_ms": dur,
+                        "content_type": ct,
+                    }
+                )
+            else:
+                flows.append(
+                    {
+                        "id": str(row["id"]),
+                        "session_id": str(row["session_id"]),
+                        "time": _format_iso_time(float(row["timestamp"])),
+                        "method": str(row["method"]),
+                        "url": url_str,
+                        "status_code": sc,
+                        "duration_ms": dur,
+                        "content_type": ct,
+                        "size": int(row["response_body_size"] or 0),
+                    }
+                )
 
         return {
             "total": total,
             "session_id": session_id,
+            "summary_metrics": {
+                "error_count": error_count,
+                "avg_duration_ms": avg_duration,
+            },
             "flows": flows,
         }
 
@@ -746,31 +799,36 @@ class StorageBus:
         mock_body: str | Mapping[str, Any] | list[Any] | None = None,
         modify_request_headers: Mapping[str, str] | None = None,
         modify_response_headers: Mapping[str, str] | None = None,
+        delay_ms: int = 0,
+        max_hits: int | None = None,
     ) -> dict[str, Any]:
         """新增一条非阻塞动态拦截规则 (InterceptRule) 并持久化至 SQLite。
 
+        支持 Mock 响应、请求/响应头改写、延迟仿真 (delay) 与连接主动中断 (abort)。
+
         Args:
-            url_pattern: URL 匹配模式（支持正则表达式、通配符或子串）。
-            action: 拦截动作，可选 'mock' 或 'modify'。
+            url_pattern: URL 匹配模式（支持通配符如 'https://api.example.com/*'）。
+            action: 拦截动作，可选 'mock'、'modify'、'delay' 或 'abort'。
             mock_status: 当 action='mock' 时返回的 HTTP 状态码，默认 200。
             mock_headers: 当 action='mock' 时返回的自定义响应头。
             mock_body: 当 action='mock' 时返回的响应正文字符串或 JSON 结构。
             modify_request_headers: 转发前注入或覆盖的请求头字典。
             modify_response_headers: 返回前注入或覆盖的响应头字典。
+            delay_ms: 注入的响应延迟毫秒数，默认 0。
+            max_hits: 最大触发次数限制，达到后规则自动停用；为 None 时永久生效。
 
         Returns:
-            包含 rule_id、action、url_pattern 与 status ("active") 的字典。
-
-        Raises:
-            ValueError: 当 url_pattern 为空或 action 非法时抛出。
+            包含 rule_id、action、url_pattern、delay_ms、max_hits 与 status ("active") 的字典。
         """
         pattern = url_pattern.strip()
         if not pattern:
             raise ValueError("url_pattern 不能为空")
 
         normalized_action = action.strip().lower()
-        if normalized_action not in {"mock", "modify"}:
-            raise ValueError(f"不支持的拦截规则动作: {action}（仅支持 'mock' 或 'modify'）")
+        if normalized_action not in {"mock", "modify", "delay", "abort"}:
+            raise ValueError(
+                f"不支持的拦截规则动作: {action}（仅支持 'mock', 'modify', 'delay', 'abort'）"
+            )
 
         if mock_body is None or isinstance(mock_body, str):
             serialized_mock_body = mock_body
@@ -786,8 +844,8 @@ class StorageBus:
                 INSERT INTO intercept_rules (
                     id, enabled, url_pattern, action, mock_status,
                     mock_headers, mock_body, modify_request_headers,
-                    modify_response_headers, created_at
-                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?);
+                    modify_response_headers, delay_ms, max_hits, hit_count, created_at
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);
                 """,
                 (
                     rule_id,
@@ -798,6 +856,8 @@ class StorageBus:
                     serialized_mock_body,
                     json.dumps(dict(modify_request_headers or {}), ensure_ascii=False),
                     json.dumps(dict(modify_response_headers or {}), ensure_ascii=False),
+                    max(0, int(delay_ms)),
+                    int(max_hits) if max_hits is not None else None,
                     created_at,
                 ),
             )
@@ -807,8 +867,27 @@ class StorageBus:
             "rule_id": rule_id,
             "action": normalized_action,
             "url_pattern": pattern,
+            "delay_ms": max(0, int(delay_ms)),
+            "max_hits": int(max_hits) if max_hits is not None else None,
             "status": "active",
         }
+
+    def increment_rule_hit(self, rule_id: str) -> None:
+        """记录规则被触发一次；若达到 max_hits 则原子化禁用规则。"""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                UPDATE intercept_rules
+                SET hit_count = hit_count + 1,
+                    enabled = CASE
+                        WHEN max_hits IS NOT NULL AND hit_count + 1 >= max_hits THEN 0
+                        ELSE enabled
+                    END
+                WHERE id = ?;
+                """,
+                (rule_id,),
+            )
+            conn.commit()
 
     def list_intercept_rules(self, *, only_enabled: bool = False) -> list[dict[str, Any]]:
         """查询当前配置的动态拦截规则列表。
@@ -826,7 +905,7 @@ class StorageBus:
                 SELECT
                     id, enabled, url_pattern, action, mock_status,
                     mock_headers, mock_body, modify_request_headers,
-                    modify_response_headers, created_at
+                    modify_response_headers, delay_ms, max_hits, hit_count, created_at
                 FROM intercept_rules
                 {where_clause}
                 ORDER BY created_at ASC;
@@ -846,6 +925,11 @@ class StorageBus:
                     "mock_body": row["mock_body"],
                     "modify_request_headers": json.loads(row["modify_request_headers"] or "{}"),
                     "modify_response_headers": json.loads(row["modify_response_headers"] or "{}"),
+                    "delay_ms": int(row["delay_ms"] or 0) if "delay_ms" in row.keys() else 0,
+                    "max_hits": int(row["max_hits"])
+                    if ("max_hits" in row.keys() and row["max_hits"] is not None)
+                    else None,
+                    "hit_count": int(row["hit_count"] or 0) if "hit_count" in row.keys() else 0,
                     "created_at": float(row["created_at"]),
                 }
             )

@@ -258,7 +258,9 @@ async def test_ops_mcp_tools_registration(tmp_path: Path) -> None:
     tools = await server.list_tools()
     tool_names = [t.name for t in tools]
 
-    assert len(tool_names) == 23
+    assert len(tool_names) == 25
+    assert "trust_ca_certificate" in tool_names
+    assert "launch_and_inspect_process" in tool_names
     assert "get_ca_certificate" in tool_names
     assert "toggle_system_proxy" in tool_names
     assert "get_system_proxy_status" in tool_names
