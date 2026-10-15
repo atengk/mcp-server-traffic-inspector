@@ -96,3 +96,16 @@ _Avoid_: NetworkJitter (网络抖动), ErrorMock (错误模拟), TrafficShaping 
 在缺乏完整协议解码器或加密四层流场景下，通过特征魔数、TLS SNI 解析、帧头特征、数据流尝试解压缩与可打印字符提炼，自适应推断通信协议与交互意图的轻量分析器。
 _Avoid_: DeepInspector (深度检测器), ProtocolGuess (协议猜测), RawScanner (原始扫描器)
 
+**DualWorkflowStandard (标准二元流水线模型)**:
+将分散的持续集成、多架构镜像构建与多渠道包发布收敛为 `ci.yml`（代码质量、合规检验与跨版本矩阵门禁）与 `release.yml`（不可变单次构建、全渠道并行分发与发布态看板）两套标准工作流的 CI/CD 编排体系。
+_Avoid_: MultiWorkflowSplit (多流分散模型), MonolithicPipeline (巨型单体流水线)
+
+**ShortCircuitGateway (路径短路网关)**:
+在持续集成流水线入口通过改动文件路径模式（如 `dorny/paths-filter`）评估变更影响面的前置分流机制；对纯文档或非代码资产的变更直接短路跳过耗时的容器构建与测试矩阵，同时安全满足合并门禁的戳记要求。
+_Avoid_: SkipCI (跳过CI), DumbTrigger (盲目触发器), JobBypass (任务绕过)
+
+**UnifiedReleaseOrchestrator (统合发版编排器)**:
+在标签发布生命周期中，先单次构建不可变的分发制品（sdist/wheel）并生成安全校验和清单，随后以扇出（Fan-Out）方式并行交付至 GitHub Release、PyPI 及多架构容器镜像仓库（GHCR），最后统合生成发布看板的一站式发版工作流。
+_Avoid_: FragmentedRelease (碎片化发布), SequentialDeploy (串行部署), ReleaseScatter (发布散列)
+
+
